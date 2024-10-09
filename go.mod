@@ -1,4 +1,4 @@
-module rds_proxy
+module github.com/noneymous/PgProxy
 
 go 1.20
 
