@@ -989,7 +989,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}()
 
 		// Cache current query executed
-		var request *PgRequest
+		var request *PgRequest      // PgRequest containing the whole FrontendMessage sent by the client
+		var requestQuery string     // SQL query extracted from the PgRequest
+		var requestQueries []string // SQL query split into sub queries, in case of multi-query query.
+		var responseCount = 0
 
 		// Loop and listen
 		for {
@@ -1021,49 +1024,87 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Execute command monitoring if activated
 			if p.fnMonitoring != nil {
 
+				// Reset query data (FrontendMessage), as communication segment has come to an end
+				switch commandResp := r.(type) {
+				case *pgproto3.ReadyForQuery:
+					logger.Debugf("Response Type '%T', resetting request data.", commandResp)
+					request = nil
+					requestQuery = ""
+					requestQueries = nil
+					responseCount = 0
+				default:
+				}
+
 				// Get query data (FrontendMessage), as communication segment has started
 				select {
 				case request = <-chRequest:
 					switch q := request.Request.(type) {
 					case *pgproto3.Query:
 						logger.Debugf("Request Type '%T'.", q)
+						requestQuery = strings.Trim(request.Request.(*pgproto3.Query).String, " ")
+						requestQueries = splitMultiQuery(requestQuery)
 					default:
 						logger.Errorf("Request Type '%T' unexpected.", q)
 					}
 				default: // Still working on the previous query
 				}
 
-				// Act on response depending on type
-				switch commandResp := r.(type) {
-				case *pgproto3.ReadyForQuery:
+				// Safety check
+				if responseCount >= len(requestQueries) {
 
-					// Reset query data (FrontendMessage), as communication segment has come to an end
-					logger.Debugf("Response Type '%T', resetting request data.", commandResp)
-					request = nil
+					// Log issue but continue communication
+					logger.Errorf(
+						"Received %d responses, while only %d were expected in this multi query:\n'%s'",
+						responseCount+1,
+						len(requestQueries),
+						prettify(requestQuery),
+					)
 
-				case *pgproto3.CommandComplete:
+				} else {
 
-					// Cast request
-					logger.Infof("Response Type '%T', logging command.", commandResp)
-					sql := strings.Trim(request.Request.(*pgproto3.Query).String, " ")
+					// Get query and prettify and unify SQL  for logging
+					sql := prettify(requestQueries[responseCount])
 
-					// Prettify and unify SQL query for logging
-					sql = prettify(sql)
+					// Act on response depending on type
+					switch commandResp := r.(type) {
+					case *pgproto3.ErrorResponse:
 
-					// Extract row count
-					rows := parseRows(logger, commandResp.CommandTag)
+						// Log action
+						logger.Infof(
+							"Response Type '%T': %s\n%s",
+							commandResp,
+							commandResp.Message,
+							"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
+						)
 
-					// Log command execution
-					errMonitoring := p.fnMonitoring(sql, request.Start, time.Now(), rows, startupRaw.Parameters["user"])
-					if errMonitoring != nil {
-						logger.Errorf("Could not monitor query: %s", errMonitoring)
+					case *pgproto3.EmptyQueryResponse:
+
+						// Log empty query without response
+						logger.Debugf("Response Type '%T'", commandResp)
+
+					case *pgproto3.CommandComplete:
+
+						// Log action
+						logger.Infof("Response Type '%T', logging command.", commandResp)
+
+						// Extract row count
+						rows := parseRows(logger, commandResp.CommandTag)
+
+						// Log command execution
+						errMonitoring := p.fnMonitoring(sql, request.Start, time.Now(), rows, startupRaw.Parameters["user"])
+						if errMonitoring != nil {
+							logger.Errorf("Could not monitor query: %s", errMonitoring)
+						}
+
+						// Increment command counter
+						responseCount++
+
+					default:
+
+						// Don't log other response types, because they would bloat the log file.
+						// Postgres returns one DataRow response per result row!
+
 					}
-
-				default:
-
-					// Don't log other response types, because they would bloat the log file.
-					// Postgres returns one DataRow response per result row!
-
 				}
 			}
 
@@ -1122,6 +1163,35 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg.Wait()
 }
 
+func splitMultiQuery(sql string) []string {
+
+	// Split queries by unquoted semicolon
+	quotedSingle := false
+	quotedDouble := false
+	queries := strings.FieldsFunc(sql, func(r rune) bool {
+		if r == '"' && !quotedSingle {
+			quotedDouble = !quotedDouble
+		}
+		if r == '\'' && !quotedDouble {
+			quotedSingle = !quotedSingle
+		}
+		return !quotedSingle && !quotedDouble && r == ';'
+	})
+
+	// Filter empty
+	queriesSanitized := make([]string, 0, len(queries))
+	for _, query := range queries {
+		query = strings.Trim(query, " ")
+		query = strings.Trim(query, "\n")
+		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
+			queriesSanitized = append(queriesSanitized, query)
+		}
+	}
+
+	// Return split queries
+	return queriesSanitized
+}
+
 // generateKey is a helper function for uniformity, generating a backend key data identifier string
 func generateKey(keyData *pgproto3.BackendKeyData) string {
 	return fmt.Sprintf("Pid-%d, Sid-%d", keyData.ProcessID, keyData.SecretKey)
@@ -1132,8 +1202,6 @@ func generateKey(keyData *pgproto3.BackendKeyData) string {
 func prettify(sql string) string {
 
 	// Make sure there is only one query per row
-	sql = strings.ReplaceAll(sql, "; ", ";\n")  // Move next query to new line
-	sql = strings.ReplaceAll(sql, ";", ";\n")   // Move next query to new line
 	sql = strings.ReplaceAll(sql, "\t", "  ")   // Replace tabulators with double spaces
 	sql = strings.ReplaceAll(sql, "    ", "  ") // Replace quad spaces with double spaces
 
@@ -1200,7 +1268,9 @@ func parseRows(logger scanUtils.Logger, tag []byte) int {
 	queryTag := string(tag)
 	queryTagFragments := strings.SplitN(queryTag, " ", -1)
 	queryRowsFragment := ""
-	if len(queryTagFragments) == 2 {
+	if len(queryTagFragments) == 1 {
+		return 0
+	} else if len(queryTagFragments) == 2 {
 		queryRowsFragment = queryTagFragments[1]
 	} else if len(queryTagFragments) == 3 {
 		queryRowsFragment = queryTagFragments[2]
