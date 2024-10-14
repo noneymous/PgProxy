@@ -53,13 +53,13 @@ func main() {
 	logger.Infof("Client timeout set to %s.", timeout.String())
 
 	// Register monitoring function (optional)
-	pgProxy.RegisterMonitoring(func(q string, qStart time.Time, qEnd time.Time, resultRows int, user string) error {
+	pgProxy.RegisterMonitoring(func(q string, tStart time.Time, tExec time.Time, tEnd time.Time, results int, user string) error {
 
 		// Indent lines
 		logMsg := "    " + strings.Join(strings.Split(q, "\n"), "\n    ")
 
 		// Log query with stats
-		logger.Debugf("Query of user '%s' returned %d row(s) in %s: \n%s", user, resultRows, qEnd.Sub(qStart), logMsg)
+		logger.Debugf("Query of user '%s' ran %s and returned %d row(s) in %s: \n%s", user, tExec.Sub(tStart), results, tEnd.Sub(tStart), logMsg)
 
 		// Return from monitoring function
 		return nil

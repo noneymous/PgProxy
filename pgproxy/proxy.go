@@ -47,7 +47,7 @@ type PgReverseProxy struct {
 	ctx     context.Context    // Context within the PgProxy is running, can be cancelled to shut down
 	ctxQuit context.CancelFunc // Cancel function for context
 
-	fnMonitoring func(q string, qStart time.Time, qEnd time.Time, resultRows int, user string) error
+	fnMonitoring func(q string, tStart time.Time, tExec time.Time, tEnd time.Time, results int, user string) error
 }
 
 // Init initializes the Postgres reverse proxy
@@ -110,7 +110,7 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 }
 
 // RegisterMonitoring can be used to configure a custom function for user activity logging or monitoring
-func (p *PgReverseProxy) RegisterMonitoring(f func(q string, qStart time.Time, qEnd time.Time, resultRows int, user string) error) {
+func (p *PgReverseProxy) RegisterMonitoring(f func(q string, tStart time.Time, tExec time.Time, tEnd time.Time, results int, user string) error) {
 	p.fnMonitoring = f
 }
 
@@ -995,6 +995,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		var requestQueries []string // SQL query split into sub queries, in case of multi-query query.
 		var commandCount = 0        // Counts the amount of SQL commands responded to by the backend (Multi-query may contain multiple SQL commands)
 		var rowCount = 0            // Counts the amount of rows returned by the backend per command response
+		var queryTime = time.Time{}
 
 		// Loop and listen
 		for {
@@ -1072,6 +1073,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Postgres returns one RowDescription response per command result
 					logger.Debugf("Response Type '%T'.", commandResp)
+					queryTime = time.Now()
 
 				case *pgproto3.DataRow:
 
@@ -1104,7 +1106,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						rows := parseRows(logger, commandResp.CommandTag)
 
 						// Log command execution
-						errMonitoring := p.fnMonitoring(sql, request.Start, time.Now(), rows, startupRaw.Parameters["user"])
+						tEnd := time.Now()
+						tExec := tEnd
+						if !queryTime.IsZero() {
+							tExec = queryTime
+						}
+						errMonitoring := p.fnMonitoring(sql, request.Start, tExec, tEnd, rows, startupRaw.Parameters["user"])
 						if errMonitoring != nil {
 							logger.Errorf("Could not monitor query: %s.", errMonitoring)
 						}
@@ -1115,6 +1122,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Increment command counter
 					commandCount++
+
+					// Reset query time for new timing
+					queryTime = time.Time{}
 
 				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
 
