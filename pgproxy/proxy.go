@@ -932,6 +932,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Forwarding original request data to database receiver routine
 			if p.fnMonitoring != nil {
+				logger.Debugf("Request Type '%T'.", r)
 				chRequest <- &PgRequest{
 					Request: r,
 					Start:   time.Now(),
@@ -992,7 +993,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		var request *PgRequest      // PgRequest containing the whole FrontendMessage sent by the client
 		var requestQuery string     // SQL query extracted from the PgRequest
 		var requestQueries []string // SQL query split into sub queries, in case of multi-query query.
-		var responseCount = 0
+		var commandCount = 0        // Counts the amount of SQL commands responded to by the backend (Multi-query may contain multiple SQL commands)
+		var rowCount = 0            // Counts the amount of rows returned by the backend per command response
 
 		// Loop and listen
 		for {
@@ -1024,23 +1026,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Execute command monitoring if activated
 			if p.fnMonitoring != nil {
 
-				// Reset query data (FrontendMessage), as communication segment has come to an end
-				switch commandResp := r.(type) {
-				case *pgproto3.ReadyForQuery:
-					logger.Debugf("Response Type '%T', resetting request data.", commandResp)
-					request = nil
-					requestQuery = ""
-					requestQueries = nil
-					responseCount = 0
-				default:
-				}
-
 				// Get query data (FrontendMessage), as communication segment has started
 				select {
 				case request = <-chRequest:
 					switch q := request.Request.(type) {
 					case *pgproto3.Query:
-						logger.Debugf("Request Type '%T'.", q)
 						requestQuery = strings.Trim(request.Request.(*pgproto3.Query).String, " ")
 						requestQueries = splitMultiQuery(requestQuery)
 					default:
@@ -1049,25 +1039,20 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				default: // Still working on the previous query
 				}
 
-				// Safety check
-				if responseCount >= len(requestQueries) {
+				// Act on response depending on type
+				switch commandResp := r.(type) {
+				case *pgproto3.ErrorResponse:
 
-					// Log issue but continue communication
-					logger.Errorf(
-						"Received %d responses, while only %d were expected in this multi query:\n'%s'",
-						responseCount+1,
-						len(requestQueries),
-						prettify(requestQuery),
-					)
+					// Check if amount of responses still matches expected amounts
+					if commandCount >= len(requestQueries) {
+						logger.Errorf(
+							"Received %d responses, while only %d were expected in this multi query:\n%s",
+							commandCount+1, len(requestQueries), prettify(requestQuery),
+						)
+					} else { // Process response if it is as expected
 
-				} else {
-
-					// Get query and prettify and unify SQL  for logging
-					sql := prettify(requestQueries[responseCount])
-
-					// Act on response depending on type
-					switch commandResp := r.(type) {
-					case *pgproto3.ErrorResponse:
+						// Get query and prettify and unify SQL  for logging
+						sql := prettify(requestQueries[commandCount])
 
 						// Log action
 						logger.Infof(
@@ -1076,16 +1061,44 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 							commandResp.Message,
 							"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
 						)
+					}
 
-					case *pgproto3.EmptyQueryResponse:
+				case *pgproto3.EmptyQueryResponse:
 
-						// Log empty query without response
-						logger.Debugf("Response Type '%T'", commandResp)
+					// Postgres returns EmptyQueryResponse if there was nothing to execute
+					logger.Debugf("Response Type '%T'.", commandResp)
 
-					case *pgproto3.CommandComplete:
+				case *pgproto3.RowDescription:
+
+					// Postgres returns one RowDescription response per command result
+					logger.Debugf("Response Type '%T'.", commandResp)
+
+				case *pgproto3.DataRow:
+
+					// Postgres returns one DataRow response per result ROW!
+					// Don't log, because it would bloat the log file.
+					rowCount++
+
+				case *pgproto3.CommandComplete:
+
+					// Make up for skipped DataRow response logs with aggregated DataRow log entry
+					if rowCount > 0 {
+						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, rowCount)
+					}
+
+					// Check if amount of responses still matches expected amounts
+					if commandCount >= len(requestQueries) {
+						logger.Errorf(
+							"Received %d responses, while only %d were expected in this multi query:\n%s",
+							commandCount+1, len(requestQueries), prettify(requestQuery),
+						)
+					} else { // Process response if it is as expected
 
 						// Log action
 						logger.Infof("Response Type '%T', logging command.", commandResp)
+
+						// Get query and prettify and unify SQL  for logging
+						sql := prettify(requestQueries[commandCount])
 
 						// Extract row count
 						rows := parseRows(logger, commandResp.CommandTag)
@@ -1093,18 +1106,32 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						// Log command execution
 						errMonitoring := p.fnMonitoring(sql, request.Start, time.Now(), rows, startupRaw.Parameters["user"])
 						if errMonitoring != nil {
-							logger.Errorf("Could not monitor query: %s", errMonitoring)
+							logger.Errorf("Could not monitor query: %s.", errMonitoring)
 						}
-
-						// Increment command counter
-						responseCount++
-
-					default:
-
-						// Don't log other response types, because they would bloat the log file.
-						// Postgres returns one DataRow response per result row!
-
 					}
+
+					// Reset command's response row counter
+					rowCount = 0
+
+					// Increment command counter
+					commandCount++
+
+				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
+
+					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
+					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", commandResp, commandResp.Name, commandResp.Value)
+
+				case *pgproto3.ReadyForQuery:
+
+					// Reset query data (FrontendMessage), as communication segment has come to an end
+					logger.Debugf("Response Type '%T', resetting request data.", commandResp)
+					request = nil
+					requestQuery = ""
+					requestQueries = nil
+					commandCount = 0
+
+				default:
+					logger.Debugf("Response Type '%T'.", commandResp)
 				}
 			}
 
