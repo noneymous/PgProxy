@@ -53,7 +53,16 @@ func main() {
 	logger.Infof("Client timeout set to %s.", timeout.String())
 
 	// Register monitoring function (optional)
-	pgProxy.RegisterMonitoring(func(q string, tStart time.Time, tExec time.Time, tEnd time.Time, results int, user string) error {
+	pgProxy.RegisterMonitoring(func(
+		q string,
+		tStart time.Time,
+		tExec time.Time,
+		tEnd time.Time,
+		results int,
+		database string,
+		user string,
+		application string,
+	) error {
 
 		// Indent lines
 		logMsg := "    " + strings.Join(strings.Split(q, "\n"), "\n    ")
