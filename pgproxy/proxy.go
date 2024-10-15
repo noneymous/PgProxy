@@ -47,7 +47,16 @@ type PgReverseProxy struct {
 	ctx     context.Context    // Context within the PgProxy is running, can be cancelled to shut down
 	ctxQuit context.CancelFunc // Cancel function for context
 
-	fnMonitoring func(q string, tStart time.Time, tExec time.Time, tEnd time.Time, results int, database string, user string, application string) error
+	fnMonitoring func(
+		dbName string,
+		dbUser string,
+		query string,
+		queryResults int,
+		queryStart time.Time,
+		queryExec time.Time,
+		queryEnd time.Time,
+		clientName string,
+	) error
 }
 
 // Init initializes the Postgres reverse proxy
@@ -111,14 +120,14 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 
 // RegisterMonitoring can be used to configure a custom function for user activity logging or monitoring
 func (p *PgReverseProxy) RegisterMonitoring(f func(
-	q string,
-	tStart time.Time,
-	tExec time.Time,
-	tEnd time.Time,
-	results int,
-	database string,
-	user string,
-	application string,
+	dbName string,
+	dbUser string,
+	query string,
+	queryResults int,
+	queryStart time.Time,
+	queryExec time.Time,
+	queryEnd time.Time,
+	clientName string,
 ) error) {
 	p.fnMonitoring = f
 }
@@ -1109,10 +1118,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						logger.Infof("Response Type '%T', logging command.", commandResp)
 
 						// Get query and prettify and unify SQL  for logging
-						sql := prettify(requestQueries[commandCount])
+						query := prettify(requestQueries[commandCount])
 
 						// Extract row count
-						rows := parseRows(logger, commandResp.CommandTag)
+						queryRows := parseRows(logger, commandResp.CommandTag)
 
 						// Log command execution
 						tEnd := time.Now()
@@ -1120,7 +1129,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						if !queryTime.IsZero() {
 							tExec = queryTime
 						}
-						errMonitoring := p.fnMonitoring(sql, request.Start, tExec, tEnd, rows, startupRaw.Parameters["database"], startupRaw.Parameters["user"], startupRaw.Parameters["application_name"])
+						errMonitoring := p.fnMonitoring(
+							startupRaw.Parameters["database"],
+							startupRaw.Parameters["user"],
+							query,
+							queryRows,
+							request.Start,
+							tExec,
+							tEnd,
+							startupRaw.Parameters["application_name"],
+						)
 						if errMonitoring != nil {
 							logger.Errorf("Could not monitor query: %s.", errMonitoring)
 						}
