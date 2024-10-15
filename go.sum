@@ -41,6 +41,8 @@ github.com/jcmturner/gofork v1.7.6/go.mod h1:1622LH6i/EZqLloHfE7IeZ0uEJwMSUyQ/nD
 github.com/jcmturner/goidentity/v6 v6.0.1/go.mod h1:X1YW3bgtvwAXju7V3LCIMpY0Gbxyjn/mY9zx4tFonSg=
 github.com/jcmturner/gokrb5/v8 v8.4.4/go.mod h1:1btQEpgT6k+unzCwX1KdWMEwPPkkgBtP+F6aCACiMrs=
 github.com/jcmturner/rpc/v2 v2.0.3/go.mod h1:VUJYCIDm3PVOEHw8sgt091/20OJjskO/YJki3ELg/Hc=
+github.com/kanmu/go-sqlfmt v0.0.0-20200215095417-d1e63e2ee5eb h1:5UKgnfnGEnP/ysm3wEClS8SN29u2GPVrlrmQIlepM/Q=
+github.com/kanmu/go-sqlfmt v0.0.0-20200215095417-d1e63e2ee5eb/go.mod h1:1+jKeqi65LLLs1GSNFRn4G/dkgg3TWeT6DTZLLQP2eM=
 github.com/kanmu/go-sqlfmt v0.0.1 h1:GCuA7fgF2XgpnwYrLb8YhrubPn/FmXXILmDwLpme4Ek=
 github.com/kanmu/go-sqlfmt v0.0.1/go.mod h1:IHjq1F1Uc2QBHRCSWTFgiwcqg6UeM14808N4usAt1KU=
 github.com/krp2/go-nfs-client v0.0.0-20200713104628-eb4e3e9b6e95/go.mod h1:w+UkaP1/xFmK8DmNyUkrw2sqqLWsNHzUaqfLT9syJRk=

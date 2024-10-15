@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
-	"github.com/kanmu/go-sqlfmt"
+	"github.com/kanmu/go-sqlfmt/sqlfmt"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/orcaman/concurrent-map/v2"
 	scanUtils "github.com/siemens/GoScans/utils"
@@ -1302,8 +1302,7 @@ func prettify(sql string) string {
 	}
 
 	// Try to format SQL user input
-	sqlFormatter := sqlfmt.Formatter{}
-	sqlFormatted, errFormat := sqlFormatter.Format(sql)
+	sqlFormatted, errFormat := sqlfmt.Format(sql, &sqlfmt.Options{})
 	if errFormat != nil {
 		sqlFormatted = sql
 	}
