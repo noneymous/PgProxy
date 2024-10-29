@@ -1,6 +1,7 @@
 package pgproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -10,9 +11,11 @@ import (
 	"fmt"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
-	"github.com/kanmu/go-sqlfmt/sqlfmt"
 	"github.com/lithammer/shortuuid/v4"
-	"github.com/orcaman/concurrent-map/v2"
+	"github.com/noneymous/go-sqlfmt/sqlfmt/formatters"
+	"github.com/noneymous/go-sqlfmt/sqlfmt/lexer"
+	"github.com/noneymous/go-sqlfmt/sqlfmt/parser"
+	cmap "github.com/orcaman/concurrent-map/v2"
 	scanUtils "github.com/siemens/GoScans/utils"
 	"gorm.io/gorm/utils"
 	"io"
@@ -50,6 +53,7 @@ type PgReverseProxy struct {
 	fnMonitoring func(
 		dbName string,
 		dbUser string,
+		table string,
 		query string,
 		queryResults int,
 		queryStart time.Time,
@@ -122,6 +126,7 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 func (p *PgReverseProxy) RegisterMonitoring(f func(
 	dbName string,
 	dbUser string,
+	table string,
 	query string,
 	queryResults int,
 	queryStart time.Time,
@@ -470,7 +475,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Let client know about issues with the database on termination
 	defer func() { // Wrap in function to use dynamic clientErrMsg, otherwise nil will be compiled
-		notifyClient(clientErrMsg)
+		if clientErrMsg != nil {
+			notifyClient(clientErrMsg)
+		}
 	}()
 
 	//////////////////////////////////////
@@ -994,19 +1001,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		wg.Add(1)
 		defer wg.Done()
 
-		// Catch potential panics to gracefully log issue with stacktrace
-		defer func() {
-
-			// Log issue
-			if r := recover(); r != nil {
-				logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
-			}
-
-			// Trigger end of communication and return
-			chDone <- struct{}{}
-			return
-		}()
-
 		// Cache current query executed
 		var request *PgRequest      // PgRequest containing the whole FrontendMessage sent by the client
 		var requestQuery string     // SQL query extracted from the PgRequest
@@ -1014,6 +1008,23 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		var commandCount = 0        // Counts the amount of SQL commands responded to by the backend (Multi-query may contain multiple SQL commands)
 		var rowCount = 0            // Counts the amount of rows returned by the backend per command response
 		var queryTime = time.Time{}
+
+		// Catch potential panics to gracefully log issue with stacktrace
+		defer func() {
+
+			// Log issue
+			if r := recover(); r != nil {
+				q := requestQuery
+				if commandCount < len(requestQueries) {
+					q = requestQueries[commandCount]
+				}
+				logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
+			}
+
+			// Trigger end of communication and return
+			chDone <- struct{}{}
+			return
+		}()
 
 		// Loop and listen
 		for {
@@ -1064,21 +1075,26 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Check if amount of responses still matches expected amounts
 					if commandCount >= len(requestQueries) {
+
+						// Get query, prettify and unify for logging
+						_, query := prettify(logger, requestQuery)
+
+						// Log error
 						logger.Errorf(
 							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commandCount+1, len(requestQueries), prettify(requestQuery),
+							commandCount+1, len(requestQueries), query,
 						)
 					} else { // Process response if it is as expected
 
-						// Get query and prettify and unify SQL  for logging
-						sql := prettify(requestQueries[commandCount])
+						// Get query, prettify and unify for logging
+						_, query := prettify(logger, requestQueries[commandCount])
 
-						// Log action
+						// Log error
 						logger.Infof(
 							"Response Type '%T': %s\n%s",
 							commandResp,
 							commandResp.Message,
-							"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
+							"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 						)
 					}
 
@@ -1108,17 +1124,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Check if amount of responses still matches expected amounts
 					if commandCount >= len(requestQueries) {
+
+						// Get query, prettify and unify for logging
+						_, query := prettify(logger, requestQuery)
+
+						// Log error
 						logger.Errorf(
 							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commandCount+1, len(requestQueries), prettify(requestQuery),
+							commandCount+1, len(requestQueries), query,
 						)
 					} else { // Process response if it is as expected
 
 						// Log action
 						logger.Infof("Response Type '%T', logging command.", commandResp)
 
-						// Get query and prettify and unify SQL  for logging
-						query := prettify(requestQueries[commandCount])
+						// Get query, prettify and unify for logging
+						table, query := prettify(logger, requestQueries[commandCount])
 
 						// Extract row count
 						queryRows := parseRows(logger, commandResp.CommandTag)
@@ -1132,6 +1153,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						errMonitoring := p.fnMonitoring(
 							startupRaw.Parameters["database"],
 							startupRaw.Parameters["user"],
+							table,
 							query,
 							queryRows,
 							request.Start,
@@ -1227,126 +1249,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg.Wait()
 }
 
-func splitMultiQuery(sql string) []string {
-
-	// Split queries by unquoted semicolon
-	quotedSingle := false
-	quotedDouble := false
-	queries := strings.FieldsFunc(sql, func(r rune) bool {
-		if r == '"' && !quotedSingle {
-			quotedDouble = !quotedDouble
-		}
-		if r == '\'' && !quotedDouble {
-			quotedSingle = !quotedSingle
-		}
-		return !quotedSingle && !quotedDouble && r == ';'
-	})
-
-	// Filter empty
-	queriesSanitized := make([]string, 0, len(queries))
-	for _, query := range queries {
-		query = strings.Trim(query, " ")
-		query = strings.Trim(query, "\n")
-		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
-			queriesSanitized = append(queriesSanitized, query)
-		}
-	}
-
-	// Return split queries
-	return queriesSanitized
-}
-
 // generateKey is a helper function for uniformity, generating a backend key data identifier string
 func generateKey(keyData *pgproto3.BackendKeyData) string {
 	return fmt.Sprintf("Pid-%d, Sid-%d", keyData.ProcessID, keyData.SecretKey)
-}
-
-// prettify takes the best effort formatting and unifying an SQL string defined by a database
-// browser or written by a user
-func prettify(sql string) string {
-
-	// Make sure there is only one query per row
-	sql = strings.ReplaceAll(sql, "\t", "  ")   // Replace tabulators with double spaces
-	sql = strings.ReplaceAll(sql, "    ", "  ") // Replace quad spaces with double spaces
-
-	// Check if query contains some indentation already
-	indentation := -1
-	lines := strings.Split(sql, "\n")
-	for _, line := range lines {
-
-		// Skip empty lines
-		if len(line) == 0 {
-			continue
-		}
-
-		// Check if this is a line with less indentation
-		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
-		if indentation == -1 || leadingSpaces < indentation {
-			indentation = leadingSpaces
-		}
-
-		// Break if no indentation found
-		if indentation == 0 {
-			break
-		}
-	}
-
-	// Remove indentation from each line, if existing
-	if indentation > 0 {
-		for i := 0; i < len(lines); i++ {
-			if len(lines[i]) > indentation { // Might be empty line
-				lines[i] = lines[i][indentation:]
-			}
-		}
-		sql = strings.Join(lines, "\n")
-	}
-
-	// Try to format SQL user input
-	sqlFormatted, errFormat := sqlfmt.Format(sql, &sqlfmt.Options{})
-	if errFormat != nil {
-		sqlFormatted = sql
-	}
-
-	// Customize formatting
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\n  , ", ",\n  ")         // Move commas to line above
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\nFROM ", "\nFROM\n  ")   // Move first where clause to next line and indent
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\nON ", " ON ")           // Keep ON clauses in same line
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\nWHERE ", "\nWHERE\n  ") // Move first where clause to next line and indent
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\nAND ", "\n  AND ")      // Indent AND clauses
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\nOR ", "\n  OR ")        // Indent OR clauses
-
-	// Remove empty lines
-	sqlFormatted = strings.ReplaceAll(sqlFormatted, "\n\n", "\n") // Remove empty lines
-
-	// Remove empty spaces and linebreaks
-	sqlFormatted = strings.Trim(sqlFormatted, "\n") // Remove leading and trailing linebreaks
-	sqlFormatted = strings.Trim(sqlFormatted, " ")  // Remove leading and trailing spaces
-
-	// Return formatted string
-	return sqlFormatted
-}
-
-// parseRows extracts the number of affected rows from a response's command tag
-func parseRows(logger scanUtils.Logger, tag []byte) int {
-	queryTag := string(tag)
-	queryTagFragments := strings.SplitN(queryTag, " ", -1)
-	queryRowsFragment := ""
-	if len(queryTagFragments) == 1 {
-		return 0
-	} else if len(queryTagFragments) == 2 {
-		queryRowsFragment = queryTagFragments[1]
-	} else if len(queryTagFragments) == 3 {
-		queryRowsFragment = queryTagFragments[2]
-	} else {
-		logger.Errorf("Unexpected command tag '%s'.", queryTag)
-		return 0
-	}
-	rows, errRows := strconv.Atoi(queryRowsFragment)
-	if errRows != nil {
-		logger.Errorf("Unexpected command tag rows count '%s'.", queryTag)
-		return 0
-	}
-	return rows
 }
 
 // saslAuth is an adapted version of github.com/jackc/pgconn (auth_scram.go) making it return proper error details.
@@ -1409,4 +1314,193 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	default:
 		return fmt.Errorf("expected AuthenticationSASLFinal, got %T", m)
 	}
+}
+
+// splitMultiQuery checks whether a query consists out of multiple single queries to be executed by the database
+// and returns a slice of single queries.
+func splitMultiQuery(sql string) []string {
+
+	// Split queries by unquoted semicolon
+	quotedSingle := false
+	quotedDouble := false
+	queries := strings.FieldsFunc(sql, func(r rune) bool {
+		if r == '"' && !quotedSingle {
+			quotedDouble = !quotedDouble
+		}
+		if r == '\'' && !quotedDouble {
+			quotedSingle = !quotedSingle
+		}
+		return !quotedSingle && !quotedDouble && r == ';'
+	})
+
+	// Filter empty
+	queriesSanitized := make([]string, 0, len(queries))
+	for _, query := range queries {
+		query = strings.Trim(query, " ")
+		query = strings.Trim(query, "\n")
+		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
+			queriesSanitized = append(queriesSanitized, query)
+		}
+	}
+
+	// Return split queries
+	return queriesSanitized
+}
+
+// prettify takes the best effort extracting the target table and formatting an SQL string received from a client
+func prettify(logger scanUtils.Logger, query string) (table string, sql string) {
+
+	// Unify spacings in the query
+	query = strings.ReplaceAll(query, "    ", "  ") // Replace quad spaces with double spaces
+	query = strings.ReplaceAll(query, "\t", "  ")   // Replace tabulators with double spaces
+
+	// Check if query contains some indentation already
+	indentation := -1
+	lines := strings.Split(query, "\n")
+	for _, line := range lines {
+
+		// Skip empty lines
+		if len(line) == 0 {
+			continue
+		}
+
+		// Check if this is a line with less indentation
+		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
+		if indentation == -1 || leadingSpaces < indentation {
+			indentation = leadingSpaces
+		}
+
+		// Break if no indentation found
+		if indentation == 0 {
+			break
+		}
+	}
+
+	// Remove potentially existing indentation from each line
+	if indentation > 0 {
+		for i := 0; i < len(lines); i++ {
+			if len(lines[i]) > indentation { // Might be empty line
+				lines[i] = lines[i][indentation:]
+			}
+		}
+		query = strings.Join(lines, "\n")
+	}
+
+	// Tokenize query
+	tokens, errTokenizer := lexer.Tokenize(query)
+	if errTokenizer != nil {
+		logger.Warningf(
+			"Could not tokenize query: '%s'\n%s",
+			errTokenizer,
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+		)
+		return
+	}
+
+	// Prepare formatter options
+	options := formatters.DefaultOptions()
+
+	// Parse query clauses from tokens
+	tokensParsed, errParse := parser.Parse(tokens, options)
+	if errParse != nil {
+		logger.Warningf(
+			"Could not parse query: '%s'\n%s",
+			errTokenizer,
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+		)
+		return
+	}
+
+	// Search for FROM clause and extract table
+	var buf bytes.Buffer
+	var errFormat error
+	for _, tokenParsed := range tokensParsed {
+
+		// Build formatted SQL string
+		if errFormat == nil {
+			errFormat = tokenParsed.Format(&buf, nil, 0)
+		}
+
+		// Check if Formatter contains table
+		switch formatter := tokenParsed.(type) {
+		case *formatters.From:
+			for _, element := range formatter.Elements {
+				switch el := element.(type) {
+				case formatters.Token:
+					if el.Type == lexer.IDENT {
+						table = el.Value
+						break
+					}
+				}
+			}
+		default:
+		}
+	}
+
+	// Set formatted SQL string if there was no error
+	if errFormat == nil && len(tokensParsed) > 0 {
+
+		// Get formatted sql query
+		sql = buf.String()
+
+	} else {
+		logger.Warningf(
+			"Could not reindent query: '%s'\n%s",
+			errFormat,
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+		)
+		sql = query
+	}
+
+	// Try to extract table manually if other mechanism didn't work
+	if table == "" {
+		const substr = " from "
+		sqlTmp := strings.ReplaceAll(sql, "\n", " ")
+		sqlTmpLower := strings.ToLower(sqlTmp)
+		if strings.Contains(sqlTmpLower, substr) {
+			i := strings.Index(sqlTmpLower, substr)
+			table = strings.TrimSpace(sqlTmp[i+len(substr):])
+			i = strings.Index(table, " ")
+			if i > 0 {
+				table = table[:i]
+			}
+		}
+	}
+
+	// Remove empty lines
+	sql = strings.ReplaceAll(sql, "\n\n", "\n") // Remove empty lines
+
+	// Remove empty spaces and linebreaks
+	for strings.HasPrefix(sql, "\n") || strings.HasSuffix(sql, "\n") ||
+		strings.HasPrefix(sql, " ") || strings.HasSuffix(sql, " ") {
+		sql = strings.Trim(sql, "\n") // Remove leading and trailing linebreaks
+		sql = strings.Trim(sql, " ")  // Remove leading and trailing spaces
+	}
+
+	// Return with what was found as table
+	// Empty if neither tokenizer nor manual search could match
+	return table, sql
+}
+
+// parseRows extracts the number of affected rows from a response's command tag
+func parseRows(logger scanUtils.Logger, tag []byte) int {
+	queryTag := string(tag)
+	queryTagFragments := strings.SplitN(queryTag, " ", -1)
+	queryRowsFragment := ""
+	if len(queryTagFragments) == 1 {
+		return 0
+	} else if len(queryTagFragments) == 2 {
+		queryRowsFragment = queryTagFragments[1]
+	} else if len(queryTagFragments) == 3 {
+		queryRowsFragment = queryTagFragments[2]
+	} else {
+		logger.Errorf("Unexpected command tag '%s'.", queryTag)
+		return 0
+	}
+	rows, errRows := strconv.Atoi(queryRowsFragment)
+	if errRows != nil {
+		logger.Errorf("Unexpected command tag rows count '%s'.", queryTag)
+		return 0
+	}
+	return rows
 }
