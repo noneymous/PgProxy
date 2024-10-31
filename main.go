@@ -56,11 +56,12 @@ func main() {
 	pgProxy.RegisterMonitoring(func(
 		dbName string,
 		dbUser string,
+		dbTables []string,
 		query string,
 		queryResults int,
 		queryStart time.Time,
-		queryExec time.Time,
-		queryEnd time.Time,
+		queryEndExec time.Time,
+		queryEndTotal time.Time,
 		clientName string,
 	) error {
 
@@ -68,7 +69,7 @@ func main() {
 		logMsg := "    " + strings.Join(strings.Split(query, "\n"), "\n    ")
 
 		// Log query with stats
-		logger.Debugf("Query of user '%s' ran %s and returned %d row(s) in %s: \n%s", dbUser, queryExec.Sub(queryStart), queryResults, queryEnd.Sub(queryStart), logMsg)
+		logger.Debugf("Query of user '%s' ran %s and returned %d row(s) in %s: \n%s", dbUser, queryEndExec.Sub(queryStart), queryResults, queryEndTotal.Sub(queryStart), logMsg)
 
 		// Return from monitoring function
 		return nil

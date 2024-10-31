@@ -53,12 +53,12 @@ type PgReverseProxy struct {
 	fnMonitoring func(
 		dbName string,
 		dbUser string,
-		table string,
+		dbTables []string,
 		query string,
 		queryResults int,
 		queryStart time.Time,
-		queryExec time.Time,
-		queryEnd time.Time,
+		queryEndExec time.Time,
+		queryEndTotal time.Time,
 		clientName string,
 	) error
 }
@@ -126,12 +126,12 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 func (p *PgReverseProxy) RegisterMonitoring(f func(
 	dbName string,
 	dbUser string,
-	table string,
+	dbTables []string,
 	query string,
 	queryResults int,
 	queryStart time.Time,
-	queryExec time.Time,
-	queryEnd time.Time,
+	queryEndExec time.Time,
+	queryEndTotal time.Time,
 	clientName string,
 ) error) {
 	p.fnMonitoring = f
@@ -1139,7 +1139,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						logger.Infof("Response Type '%T', logging command.", commandResp)
 
 						// Get query, prettify and unify for logging
-						table, query := prettify(logger, requestQueries[commandCount])
+						tables, query := prettify(logger, requestQueries[commandCount])
 
 						// Extract row count
 						queryRows := parseRows(logger, commandResp.CommandTag)
@@ -1153,7 +1153,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						errMonitoring := p.fnMonitoring(
 							startupRaw.Parameters["database"],
 							startupRaw.Parameters["user"],
-							table,
+							tables,
 							query,
 							queryRows,
 							request.Start,
@@ -1347,8 +1347,9 @@ func splitMultiQuery(sql string) []string {
 	return queriesSanitized
 }
 
-// prettify takes the best effort extracting the target table and formatting an SQL string received from a client
-func prettify(logger scanUtils.Logger, query string) (table string, sql string) {
+// prettify returns a formatted SQL query string and a list of database tables it is targeting. An SQL query
+// does not necessarily need to target a table. Also, it might target multiple ones via subqueries.
+func prettify(logger scanUtils.Logger, query string) (tables []string, sql string) {
 
 	// Unify spacings in the query
 	query = strings.ReplaceAll(query, "    ", "  ") // Replace quad spaces with double spaces
@@ -1397,6 +1398,9 @@ func prettify(logger scanUtils.Logger, query string) (table string, sql string) 
 		return
 	}
 
+	// Search token tree for FROM tables names
+	tables = findTableNames(tokens)
+
 	// Prepare formatter options
 	options := formatters.DefaultOptions()
 
@@ -1411,29 +1415,12 @@ func prettify(logger scanUtils.Logger, query string) (table string, sql string) 
 		return
 	}
 
-	// Search for FROM clause and extract table
-	var buf bytes.Buffer
+	// Format parsed tokens into buffer
+	var sqlBuf bytes.Buffer
 	var errFormat error
 	for _, tokenParsed := range tokensParsed {
-
-		// Build formatted SQL string
 		if errFormat == nil {
-			errFormat = tokenParsed.Format(&buf, nil, 0)
-		}
-
-		// Check if Formatter contains table
-		switch formatter := tokenParsed.(type) {
-		case *formatters.From:
-			for _, element := range formatter.Elements {
-				switch el := element.(type) {
-				case formatters.Token:
-					if el.Type == lexer.IDENT {
-						table = el.Value
-						break
-					}
-				}
-			}
-		default:
+			errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
 		}
 	}
 
@@ -1441,7 +1428,7 @@ func prettify(logger scanUtils.Logger, query string) (table string, sql string) 
 	if errFormat == nil && len(tokensParsed) > 0 {
 
 		// Get formatted sql query
-		sql = buf.String()
+		sql = sqlBuf.String()
 
 	} else {
 		logger.Warningf(
@@ -1450,21 +1437,6 @@ func prettify(logger scanUtils.Logger, query string) (table string, sql string) 
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
 		sql = query
-	}
-
-	// Try to extract table manually if other mechanism didn't work
-	if table == "" {
-		const substr = " from "
-		sqlTmp := strings.ReplaceAll(sql, "\n", " ")
-		sqlTmpLower := strings.ToLower(sqlTmp)
-		if strings.Contains(sqlTmpLower, substr) {
-			i := strings.Index(sqlTmpLower, substr)
-			table = strings.TrimSpace(sqlTmp[i+len(substr):])
-			i = strings.Index(table, " ")
-			if i > 0 {
-				table = table[:i]
-			}
-		}
 	}
 
 	// Remove empty lines
@@ -1477,9 +1449,9 @@ func prettify(logger scanUtils.Logger, query string) (table string, sql string) 
 		sql = strings.Trim(sql, " ")  // Remove leading and trailing spaces
 	}
 
-	// Return with what was found as table
+	// Return with what was found as tables
 	// Empty if neither tokenizer nor manual search could match
-	return table, sql
+	return tables, sql
 }
 
 // parseRows extracts the number of affected rows from a response's command tag
@@ -1503,4 +1475,23 @@ func parseRows(logger scanUtils.Logger, tag []byte) int {
 		return 0
 	}
 	return rows
+}
+
+// findTableNames iterates over the elements to search for FROM token types indicating a table name subsequently
+func findTableNames(tokens []lexer.Token) []string {
+	var tables []string
+	var found = false
+	for _, token := range tokens {
+		if token.Type == lexer.FROM { // Mark found to indicate next value is table name
+			found = true
+		} else if found && token.Type == lexer.IDENT {
+			if !utils.Contains(tables, token.Value) {
+				tables = append(tables, token.Value)
+			}
+			found = false // Reset after associated IDENT was found
+		} else {
+			found = false // Reset because subsequent one was not an IDENT
+		}
+	}
+	return tables
 }
