@@ -1,12 +1,14 @@
 module github.com/noneymous/PgProxy
 
-go 1.20
+go 1.22.0
+
+toolchain go1.23.2
 
 require (
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgproto3/v2 v2.3.3
 	github.com/lithammer/shortuuid/v4 v4.0.0
-	github.com/noneymous/go-sqlfmt v1.2.0
+	github.com/noneymous/go-sqlfmt v1.3.0
 	github.com/orcaman/concurrent-map/v2 v2.0.1
 	github.com/siemens/GoScans v1.0.2
 	golang.org/x/crypto v0.28.0

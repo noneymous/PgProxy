@@ -51,6 +51,8 @@ github.com/noneymous/go-redistributable-checker v0.0.0-20210325125326-f5f65eef47
 github.com/noneymous/go-sqlfmt v1.0.0/go.mod h1:2SRz0S6MZ0dqYM3XBRu2gIZO4OqJWV+QqYX/fpiOw1g=
 github.com/noneymous/go-sqlfmt v1.2.0 h1:EfsseX78wQHbtud7ZsirCZ9i46qg5gPQHVaQS75timA=
 github.com/noneymous/go-sqlfmt v1.2.0/go.mod h1:2SRz0S6MZ0dqYM3XBRu2gIZO4OqJWV+QqYX/fpiOw1g=
+github.com/noneymous/go-sqlfmt v1.3.0 h1:7xsimqMbL9rIP9pjrDHW/CcnfQBdaav4k+t90Ox9oEY=
+github.com/noneymous/go-sqlfmt v1.3.0/go.mod h1:Gg4kLIkbFNhazxq00S6XwuWF474sV4m3R702aZ0EPCY=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
 github.com/orcaman/concurrent-map/v2 v2.0.1/go.mod h1:9Eq3TG2oBe5FirmYWQfYO5iH1q0Jv47PLaNK++uCdOM=
 github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
