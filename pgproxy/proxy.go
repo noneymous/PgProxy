@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/lithammer/shortuuid/v4"
+	"github.com/noneymous/go-sqlfmt/sqlfmt"
 	"github.com/noneymous/go-sqlfmt/sqlfmt/formatters"
 	"github.com/noneymous/go-sqlfmt/sqlfmt/lexer"
 	"github.com/noneymous/go-sqlfmt/sqlfmt/parser"
@@ -856,7 +857,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		msg := "Active database connections:"
 		if p.connectionMap.Count() > 0 {
 			for k, v := range p.connectionMap.Items() {
-				msg += fmt.Sprintf("\n\t%-25s: %s", k, v.RemoteAddr())
+				msg += fmt.Sprintf("\n    %-25s: %s", k, v.RemoteAddr())
 			}
 			p.log.Debugf(msg)
 		} else {
@@ -1419,20 +1420,22 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	var sqlBuf bytes.Buffer
 	var errFormat error
 	for _, tokenParsed := range tokensParsed {
-		if errFormat == nil {
-			errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
+		errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
+		if errFormat != nil {
+			break
 		}
 	}
 
-	// Set formatted SQL string if there was no error
-	if errFormat == nil && len(tokensParsed) > 0 {
+	// Get formatted sql string
+	sql = sqlBuf.String()
 
-		// Get formatted sql query
-		sql = sqlBuf.String()
+	// Compare if formatted query still has the same logic as input
+	valid := sqlfmt.CompareSemantic(query, sql)
 
-	} else {
+	// Reset formatted SQL string to original input if there was an error
+	if !valid || errFormat != nil {
 		logger.Warningf(
-			"Could not reindent query: '%s'\n%s",
+			"Could not format query: '%s'\n%s",
 			errFormat,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
