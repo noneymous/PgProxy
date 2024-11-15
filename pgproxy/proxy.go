@@ -155,7 +155,7 @@ func (p *PgReverseProxy) Stop() {
 
 	// Wait for active connections to be terminated
 	p.wg.Wait()
-	p.log.Debugf("PgProxy stopped.", p.connectionCtr)
+	p.log.Debugf("PgProxy stopped.")
 }
 
 // Serve listens for incoming connections and processes them in an asynchronous goroutine
