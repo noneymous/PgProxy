@@ -38,11 +38,12 @@ var ErrInternal = &pgconn.PgError{
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
 // connections and redirecting them to configured database servers, based on SNIs indicated by the client.
 type PgReverseProxy struct {
-	log             scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
-	listenerPort    uint             // PgProxy port to listen on
-	listener        net.Listener     // The net listener listening for incoming client connections to be proxied
-	listenerTimeout time.Duration    // Inactivity timeout for connected clients
-	listenerConfigs map[string]Sni   // List of certificates to listen for
+	log              scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
+	listener         net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
+	listenerPort     uint             // PgProxy port to listen on
+	listenerForceSsl bool             // PgProxy flag whether to force SSL or allow plaintext connections
+	listenerTimeout  time.Duration    // Inactivity timeout for connected clients
+	listenerConfigs  map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
 	connectionMap cmap.ConcurrentMap[string, net.Conn] // Map to lookup network connections by backend key data
 	connectionCtr uint                                 // Counter for currently active proxy connections
@@ -65,10 +66,15 @@ type PgReverseProxy struct {
 }
 
 // Init initializes the Postgres reverse proxy
-func Init(log scanUtils.Logger, port uint, timeout time.Duration) (*PgReverseProxy, error) {
+func Init(
+	log scanUtils.Logger,
+	listenerPort uint,
+	listenerForceSsl bool,
+	listenerTimeout time.Duration,
+) (*PgReverseProxy, error) {
 
 	// Open listener
-	listener, errListener := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	listener, errListener := net.Listen("tcp", fmt.Sprintf(":%d", listenerPort))
 	if errListener != nil {
 		return nil, errListener
 	}
@@ -78,14 +84,15 @@ func Init(log scanUtils.Logger, port uint, timeout time.Duration) (*PgReversePro
 
 	// Prepare PgProxy
 	pgProxy := PgReverseProxy{
-		log:             log,
-		listenerPort:    port,
-		listener:        listener,
-		listenerConfigs: make(map[string]Sni),
-		listenerTimeout: timeout,
-		ctx:             ctx,
-		ctxCancelFunc:   ctxCancel,
-		connectionMap:   cmap.New[net.Conn](),
+		log:              log,
+		listener:         listener,
+		listenerPort:     listenerPort,
+		listenerForceSsl: listenerForceSsl,
+		listenerTimeout:  listenerTimeout,
+		listenerConfigs:  make(map[string]Sni),
+		ctx:              ctx,
+		ctxCancelFunc:    ctxCancel,
+		connectionMap:    cmap.New[net.Conn](),
 	}
 
 	// Return initialized PgProxy
@@ -301,9 +308,53 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Prepare client backend to receive client messages
 	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(client), client)
 
+	// Prepare memory for error message to be transferred to client
+	var clientErrMsg *pgconn.PgError
+
+	// Prepare function to notify client
+	var notifyClient = func(errPg *pgconn.PgError) {
+
+		// Prepare error response
+		errResp := &pgproto3.ErrorResponse{
+			Severity:            errPg.Severity,
+			SeverityUnlocalized: "",
+			Code:                errPg.Code,
+			Message:             errPg.Message,
+			Detail:              errPg.Detail,
+			Hint:                errPg.Hint,
+			Position:            errPg.Position,
+			InternalPosition:    errPg.InternalPosition,
+			InternalQuery:       errPg.InternalQuery,
+			Where:               errPg.Where,
+			SchemaName:          errPg.SchemaName,
+			TableName:           errPg.TableName,
+			ColumnName:          errPg.ColumnName,
+			DataTypeName:        errPg.DataTypeName,
+			ConstraintName:      errPg.ConstraintName,
+			File:                errPg.File,
+			Line:                errPg.Line,
+			Routine:             errPg.Routine,
+			UnknownFields:       nil,
+		}
+
+		// Log and execute action
+		logger.Debugf("Returning fatal error to client.")
+		errSend := clientBackend.Send(errResp)
+		if errSend != nil {
+			logger.Errorf("Could not return fatal error to client: %s.", errSend)
+		}
+	}
+
+	// Let client know about issues with the database on termination
+	defer func() { // Wrap in function to use dynamic clientErrMsg, otherwise nil will be compiled
+		if clientErrMsg != nil {
+			notifyClient(clientErrMsg)
+		}
+	}()
+
 	// Prepare memory for startup data
 	var startupRaw *pgproto3.StartupMessage
-	var startupSsl = false
+	var isSsl = false
 
 	////////////////////////////////////////////////////////////////
 	// Read startup messages from client until conditions are agreed
@@ -323,6 +374,20 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		switch m := startup.(type) {
 		case *pgproto3.StartupMessage:
+
+			// Reject plaintext connections if necessary
+			if p.listenerForceSsl && !isSsl {
+
+				// Set error details to be forwarded to client
+				clientErrMsg = &pgconn.PgError{
+					Code:    "FATAL",
+					Message: "SSL connection required",
+				}
+
+				// Log error and return
+				logger.Infof("Client plaintext connection not allowed.")
+				return // Abort in case of communication error
+			}
 
 			// Keep details from startup message for later
 			startupRaw = m
@@ -384,7 +449,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Set SSL flag
-			startupSsl = true
+			isSsl = true
 
 			// Upgrade to SSL encrypted channel
 			_, errWrite := client.Write([]byte{'S'})
@@ -424,7 +489,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Log SNI
-	if !startupSsl {
+	if !isSsl {
 		logger.Debugf("Client connecting plaintext without SNI, default database will be selected.")
 	}
 	if sni == "" {
@@ -457,50 +522,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		logger.Errorf("Client startup failed: unexpected password response: %T.", responseAuth)
 		return // Abort in case of communication error
 	}
-
-	// Prepare memory for error message to be transferred to client
-	var clientErrMsg *pgconn.PgError
-
-	// Prepare function to notify client
-	var notifyClient = func(errPg *pgconn.PgError) {
-
-		// Prepare error response
-		errResp := &pgproto3.ErrorResponse{
-			Severity:            errPg.Severity,
-			SeverityUnlocalized: "",
-			Code:                errPg.Code,
-			Message:             errPg.Message,
-			Detail:              errPg.Detail,
-			Hint:                errPg.Hint,
-			Position:            errPg.Position,
-			InternalPosition:    errPg.InternalPosition,
-			InternalQuery:       errPg.InternalQuery,
-			Where:               errPg.Where,
-			SchemaName:          errPg.SchemaName,
-			TableName:           errPg.TableName,
-			ColumnName:          errPg.ColumnName,
-			DataTypeName:        errPg.DataTypeName,
-			ConstraintName:      errPg.ConstraintName,
-			File:                errPg.File,
-			Line:                errPg.Line,
-			Routine:             errPg.Routine,
-			UnknownFields:       nil,
-		}
-
-		// Log and execute action
-		logger.Debugf("Returning fatal error to client.")
-		errSend := clientBackend.Send(errResp)
-		if errSend != nil {
-			logger.Errorf("Could not return fatal error to client: %s.", errSend)
-		}
-	}
-
-	// Let client know about issues with the database on termination
-	defer func() { // Wrap in function to use dynamic clientErrMsg, otherwise nil will be compiled
-		if clientErrMsg != nil {
-			notifyClient(clientErrMsg)
-		}
-	}()
 
 	//////////////////////////////////////
 	// Connect database to proxy client to
