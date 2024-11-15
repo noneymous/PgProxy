@@ -308,7 +308,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Read startup message
 		startup, errStartup := clientBackend.ReceiveStartupMessage()
-		if errStartup != nil {
+		if errors.Is(errStartup, io.ErrUnexpectedEOF) { // Connection closed by client
+			logger.Debugf("Client terminated connection.")
+			return
+		} else if errStartup != nil {
 			logger.Errorf("Client startup failed: %s.", errStartup)
 			return
 		}
@@ -423,7 +426,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Receive password from client
 	responseAuth, errResponseAuth := clientBackend.Receive()
 	if errors.Is(errResponseAuth, io.ErrUnexpectedEOF) { // Connection closed by client
-		logger.Infof("Client terminated connection.")
+		logger.Debugf("Client terminated connection.")
 		return
 	} else if errResponseAuth != nil {
 		logger.Errorf("Client startup failed: could not receive password: %s.", errResponseAuth)
@@ -936,7 +939,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Log error with respective criticality
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by client
-					logger.Infof("Client terminated connection.")
+					logger.Debugf("Client terminated connection.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
 				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
