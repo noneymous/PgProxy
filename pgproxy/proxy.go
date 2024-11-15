@@ -308,7 +308,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Read startup message
 		startup, errStartup := clientBackend.ReceiveStartupMessage()
-		if errors.Is(errStartup, io.ErrUnexpectedEOF) { // Connection closed by client
+		if errors.Is(errStartup, io.EOF) { // Connection closed by client
 			logger.Debugf("Client terminated connection.")
 			return
 		} else if errStartup != nil {
