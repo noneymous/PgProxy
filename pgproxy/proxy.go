@@ -227,9 +227,6 @@ func (p *PgReverseProxy) Serve() { // Log termination
 	// Continuously listen for incoming connections
 	for {
 
-		// Log active connections
-		p.log.Debugf("PgProxy has %d active connection(s).", p.connectionCtr)
-
 		// Accept connection
 		client, errClient := p.listener.Accept()
 		if errClient != nil {
@@ -588,7 +585,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Log database selection
-	logger.Debugf("Connecting to database '%s' for client.", listenerConfig.Database.Host)
+	logger.Debugf("Proxying to database '%s'.", listenerConfig.Database.Host)
 
 	// Build address for connection
 	address := fmt.Sprintf("%s:%d", listenerConfig.Database.Host, listenerConfig.Database.Port)
@@ -633,7 +630,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log SSL initialization
-		logger.Debugf("Upgrading database connection to SSL for client.")
+		logger.Debugf("Upgrading database connection to SSL.")
 
 		// Send SSL request
 		errDatabaseSend := databaseFrontend.Send(&pgproto3.SSLRequest{})
@@ -746,7 +743,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	////////////////////////////////////////////////////////////////
 	// Initialize database connection using startup data from client
 	////////////////////////////////////////////////////////////////
-	logger.Debugf("Initializing database connection for client.")
+	logger.Debugf("Initializing database connection.")
 
 	// Forward client startup data to database
 	errDatabaseSend := databaseFrontend.Send(startupRaw)
@@ -761,7 +758,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Authenticate on database using details from client
-	logger.Debugf("Authenticating database connection for client.")
+	logger.Debugf("Authenticating database connection.")
 	do := true
 	for do {
 
@@ -1360,7 +1357,7 @@ func (p *PgReverseProxy) logConnections() {
 	if p.connectionMap.Count() > 0 {
 		for _, v := range p.connectionMap.Items() {
 			msg += fmt.Sprintf(
-				"\n    Pid: %-5d | Sid: %-10d | Origin: %-21s | Client: '%s' | User: %s",
+				"\n    Pid: %-5d | Sid: %-10d | Origin: %-21s | Client: '%s' \t| User: %s",
 				v.Pid,
 				v.Sid,
 				v.Connection.RemoteAddr(),
