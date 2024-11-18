@@ -35,18 +35,36 @@ var ErrInternal = &pgconn.PgError{
 	Message:  "database currently not available",
 }
 
+// ErrCertificate is returned if no suitable certificate could be found
+type ErrCertificate struct {
+	Message string
+}
+
+func (e *ErrCertificate) Error() string {
+	return e.Message
+}
+
+type PgConn struct {
+	Pid        uint32
+	Sid        uint32
+	User       string
+	Client     string
+	Connection net.Conn
+}
+
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
 // connections and redirecting them to configured database servers, based on SNIs indicated by the client.
 type PgReverseProxy struct {
-	log              scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
-	listener         net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
-	listenerPort     uint             // PgProxy port to listen on
-	listenerForceSsl bool             // PgProxy flag whether to force SSL or allow plaintext connections
-	listenerTimeout  time.Duration    // Inactivity timeout for connected clients
-	listenerConfigs  map[string]Sni   // List of SNI certificates and database configurations to redirect clients
+	log                scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
+	listener           net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
+	listenerPort       uint             // PgProxy port to listen on
+	listenerForceSsl   bool             // PgProxy flag whether to force SSL or allow plaintext connections
+	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
+	listenerTimeout    time.Duration    // Inactivity timeout for connected clients
+	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
-	connectionMap cmap.ConcurrentMap[string, net.Conn] // Map to lookup network connections by backend key data
-	connectionCtr uint                                 // Counter for currently active proxy connections
+	connectionMap cmap.ConcurrentMap[string, PgConn] // Map to lookup network connections by backend key data
+	connectionCtr uint                               // Counter for currently active proxy connections
 
 	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
@@ -69,7 +87,8 @@ type PgReverseProxy struct {
 func Init(
 	log scanUtils.Logger,
 	listenerPort uint,
-	listenerForceSsl bool,
+	listenerForceSsl bool, // Whether to reject plain text connections
+	listenerDefaultSni bool, // Whether to reject SSL connections without SNI. Without SNI the first SNI configuration would be applied as the default.
 	listenerTimeout time.Duration,
 ) (*PgReverseProxy, error) {
 
@@ -84,15 +103,16 @@ func Init(
 
 	// Prepare PgProxy
 	pgProxy := PgReverseProxy{
-		log:              log,
-		listener:         listener,
-		listenerPort:     listenerPort,
-		listenerForceSsl: listenerForceSsl,
-		listenerTimeout:  listenerTimeout,
-		listenerConfigs:  make(map[string]Sni),
-		ctx:              ctx,
-		ctxCancelFunc:    ctxCancel,
-		connectionMap:    cmap.New[net.Conn](),
+		log:                log,
+		listener:           listener,
+		listenerPort:       listenerPort,
+		listenerForceSsl:   listenerForceSsl,
+		listenerDefaultSni: listenerDefaultSni,
+		listenerTimeout:    listenerTimeout,
+		listenerConfigs:    make(map[string]Sni),
+		ctx:                ctx,
+		ctxCancelFunc:      ctxCancel,
+		connectionMap:      cmap.New[PgConn](),
 	}
 
 	// Return initialized PgProxy
@@ -108,7 +128,7 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 	for _, s := range sni {
 
 		// Set first one as default one
-		if len(p.listenerConfigs) == 0 {
+		if p.listenerDefaultSni && len(p.listenerConfigs) == 0 {
 			p.listenerConfigs[""] = s
 		}
 
@@ -295,7 +315,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Get listener config based on SNI
 			listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
 			if !okListenerConfig {
-				return nil, fmt.Errorf("no certificate for '%s'", t.ServerName)
+				return nil, &ErrCertificate{Message: fmt.Sprintf("no certificate for '%s'", t.ServerName)}
 			}
 
 			// Return related certificate
@@ -399,8 +419,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Get connection to cancel by key
-			con, okCon := p.connectionMap.Get(generateKey(&key))
-			if !okCon {
+			pgConn, okPgConn := p.connectionMap.Get(generateKey(&key))
+			if !okPgConn {
 				logger.Errorf("Cancel request failed: Unknown connection '%T'.", key)
 				return // Abort in case of communication error
 			}
@@ -413,14 +433,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			binary.BigEndian.PutUint32(buf[12:16], m.SecretKey)
 
 			// Send cancel request on connection
-			_, errWrite := con.Write(buf)
+			_, errWrite := pgConn.Connection.Write(buf)
 			if errWrite != nil {
 				logger.Errorf("Cancel request failed: %s.", errWrite)
 				return // Abort in case of communication error
 			}
 
 			// Read cancel response from connection
-			_, errRead := con.Read(buf)
+			_, errRead := pgConn.Connection.Read(buf)
 			if errRead != io.EOF {
 				logger.Errorf("Cancel request failed: %s.", errRead)
 				return // Abort in case of communication error
@@ -462,6 +482,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errors.Is(errClientTls, io.EOF) { // Connection closed by client
 				logger.Debugf("Client terminated connection.")
 				return
+			} else if errors.Is(errClientTls, &ErrCertificate{}) {
+				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
+				return
 			} else if errClientTls != nil {
 				_ = clientTls.Close()
 				logger.Errorf("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
@@ -489,16 +512,44 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 	}
 
-	// Log SNI
+	// Check if client can be dispatched to suitable listener configuration
+	if !p.listenerDefaultSni && sni == "" {
+		if isSsl {
+
+			// Prepare error to return to the client
+			clientErrMsg = &pgconn.PgError{
+				Code:    "FATAL",
+				Message: "SSL connection requires SNI data",
+			}
+
+			// Log situation and return
+			logger.Infof("Client connection without SNI cannot be dispatched, there is no default database.")
+			return
+		} else {
+
+			// Prepare error to return to the client
+			clientErrMsg = &pgconn.PgError{
+				Code:    "FATAL",
+				Message: "SSL connection with SNI required",
+			}
+
+			// Log situation and return
+			logger.Infof("Client connection without SSL/SNI cannot be dispatched, there is no default database.")
+			return
+		}
+	}
+
+	// Log target database derived from connection settings
 	if !isSsl {
-		logger.Debugf("Client without SNI, default database will be selected.")
-	}
-	if sni == "" {
-		logger.Debugf("Client with empty SNI, default database will be selected.")
+		logger.Debugf("Client connection without SSL dispatching to DEFAULT database.")
+	} else if sni == "" {
+		logger.Debugf("Client connection without SNI dispatching to DEFAULT database.")
 	} else {
-		logger.Debugf("Client with SNI '%s', associated database will be selected.", sni)
+		logger.Debugf("Client connection dispatching to database '%s'.", sni)
 	}
-	logger.Debugf("Client connecting as user '%s'.", startupRaw.Parameters["user"])
+
+	// Log user requesting connection
+	logger.Debugf("Client connection authenticating as '%s'.", startupRaw.Parameters["user"])
 
 	// Request password from client
 	logger.Debugf("Requesting authentication password from client.")
@@ -525,19 +576,19 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		return // Abort in case of communication error
 	}
 
-	//////////////////////////////////////
-	// Connect database to proxy client to
-	//////////////////////////////////////
+	///////////////////////////////////////
+	// Connect to database for proxy client
+	///////////////////////////////////////
 
 	// Prepare database target address
 	listenerConfig, okListenerConfig := p.listenerConfigs[sni]
 	if !okListenerConfig {
-		logger.Errorf("Client startup failed: could not read database configuration for '%s'.", sni)
+		logger.Errorf("Database startup failed: no database configuration for '%s'.", sni)
 		return // Abort in case of communication error
 	}
 
 	// Log database selection
-	logger.Debugf("Connecting database '%s' for client.", listenerConfig.Database.Host)
+	logger.Debugf("Connecting to database '%s' for client.", listenerConfig.Database.Host)
 
 	// Build address for connection
 	address := fmt.Sprintf("%s:%d", listenerConfig.Database.Host, listenerConfig.Database.Port)
@@ -553,7 +604,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log error and return
-		logger.Errorf("Client startup failed: could not connect to database '%s': %s.", address, errDatabase)
+		logger.Errorf("Database startup failed: could not connect to database '%s': %s.", address, errDatabase)
 		return // Abort in case of communication error
 	}
 
@@ -899,18 +950,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	///////////////////////////////////////////////////////////////////////
 	// Cache connections for later lookups, e.g. to execute cancel requests
 	///////////////////////////////////////////////////////////////////////
-	fnLogDbConnections := func() {
-		msg := "Active database connections:"
-		if p.connectionMap.Count() > 0 {
-			for k, v := range p.connectionMap.Items() {
-				msg += fmt.Sprintf("\n    %-25s: %s", k, v.RemoteAddr())
-			}
-			p.log.Debugf(msg)
-		} else {
-			msg += fmt.Sprintf("\n\t-")
-			p.log.Debugf(msg)
-		}
-	}
+	logger.Infof("Caching connection details.")
 
 	// Cache key data and associated database connection if available
 	if keyData != nil {
@@ -919,17 +959,23 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		k := generateKey(keyData)
 
 		// Store connection under key
-		p.connectionMap.Set(k, connDatabase)
+		p.connectionMap.Set(k, PgConn{
+			Pid:        keyData.ProcessID,
+			Sid:        keyData.SecretKey,
+			User:       startupRaw.Parameters["user"],
+			Client:     startupRaw.Parameters["application_name"],
+			Connection: connDatabase,
+		})
 
 		// Make sure entry is cleaned from map after database connection is terminated
 		defer func() {
 			p.connectionMap.Remove(k)
-			fnLogDbConnections()
+			p.logConnections()
 		}()
 	}
 
 	// Log currently fully established connections
-	fnLogDbConnections()
+	p.logConnections()
 
 	/////////////////////////////////////////////////////////////
 	// Proxy continuous communication between client and database
@@ -1308,9 +1354,30 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg.Wait()
 }
 
+// logConnections prints currently active connections utilizing the logger
+func (p *PgReverseProxy) logConnections() {
+	msg := "Active database connections:"
+	if p.connectionMap.Count() > 0 {
+		for _, v := range p.connectionMap.Items() {
+			msg += fmt.Sprintf(
+				"\n    Pid: %-5d | Sid: %-10d | Origin: %-21s | Client: '%s' | User: %s",
+				v.Pid,
+				v.Sid,
+				v.Connection.RemoteAddr(),
+				v.Client,
+				v.User,
+			)
+		}
+		p.log.Debugf(msg)
+	} else {
+		msg += fmt.Sprintf("\n\t-")
+		p.log.Debugf(msg)
+	}
+}
+
 // generateKey is a helper function for uniformity, generating a backend key data identifier string
 func generateKey(keyData *pgproto3.BackendKeyData) string {
-	return fmt.Sprintf("Pid-%d, Sid-%d", keyData.ProcessID, keyData.SecretKey)
+	return fmt.Sprintf("%d-%d", keyData.ProcessID, keyData.SecretKey)
 }
 
 // saslAuth is an adapted version of github.com/jackc/pgconn (auth_scram.go) making it return proper error details.
