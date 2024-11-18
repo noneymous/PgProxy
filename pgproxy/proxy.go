@@ -490,13 +490,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Log SNI
 	if !isSsl {
-		logger.Debugf("Client connecting plaintext without SNI, default database will be selected.")
+		logger.Debugf("Client without SNI, default database will be selected.")
 	}
 	if sni == "" {
-		logger.Debugf("Client connecting with empty SNI, default database will be selected.")
+		logger.Debugf("Client with empty SNI, default database will be selected.")
 	} else {
-		logger.Debugf("Client connecting with SNI '%s', associated database will be selected.", sni)
+		logger.Debugf("Client with SNI '%s', associated database will be selected.", sni)
 	}
+	logger.Debugf("Client connecting as user '%s'.", startupRaw.Parameters["user"])
 
 	// Request password from client
 	logger.Debugf("Requesting authentication password from client.")
@@ -946,7 +947,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		Request pgproto3.FrontendMessage
 		Start   time.Time
 	}
-	chRequest := make(chan *PgRequest, 1)
+	chRequestCount := 0
+	chRequest := make(chan *PgRequest, 10)
 
 	// Listen for client requests
 	go func() {
@@ -1007,6 +1009,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					Request: r,
 					Start:   time.Now(),
 				}
+				chRequestCount++
+				logger.Debugf("%d PG requests queued.", chRequestCount)
 			}
 
 			// Forward to database
@@ -1104,6 +1108,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Get query data (FrontendMessage), as communication segment has started
 				select {
 				case request = <-chRequest:
+					chRequestCount--
 					switch q := request.Request.(type) {
 					case *pgproto3.Query:
 						requestQuery = strings.Trim(request.Request.(*pgproto3.Query).String, " ")
@@ -1454,7 +1459,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	if errParse != nil {
 		logger.Warningf(
 			"Could not parse query: '%s'\n%s",
-			errTokenizer,
+			errParse,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
 		return
