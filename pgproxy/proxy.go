@@ -208,9 +208,7 @@ func (p *PgReverseProxy) Serve() { // Log termination
 	for {
 
 		// Log active connections
-		if p.connectionCtr > 0 {
-			p.log.Debugf("PgProxy has %d active connections.", p.connectionCtr)
-		}
+		p.log.Debugf("PgProxy has %d active connection(s).", p.connectionCtr)
 
 		// Accept connection
 		client, errClient := p.listener.Accept()
@@ -943,12 +941,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg := new(sync.WaitGroup)
 
 	// Prepare buffered channel for communication between query and response
-	type PgRequest struct {
-		Request pgproto3.FrontendMessage
-		Start   time.Time
+	type QueryData struct {
+		Raw       string
+		Queries   []string
+		Timestamp time.Time
 	}
-	chRequestCount := 0
-	chRequest := make(chan *PgRequest, 10)
+	chQueryData := make(chan *QueryData, 1)
 
 	// Listen for client requests
 	go func() {
@@ -1002,15 +1000,28 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				logger.Errorf("Updating client deadline failed: %s", errDeadlineUpdate)
 			}
 
-			// Forwarding original request data to database receiver routine
+			// Forwarding query data to database receiver routine
 			if p.fnMonitoring != nil {
-				logger.Debugf("Request Type '%T'.", r)
-				chRequest <- &PgRequest{
-					Request: r,
-					Start:   time.Now(),
+				logger.Debugf("Request  Type '%T'.", r)
+
+				// Prepare data
+				switch q := r.(type) {
+				case *pgproto3.Query:
+					query := strings.Trim(q.String, " ")
+					chQueryData <- &QueryData{
+						Raw:       query,               // Original query string. Might be single query or sequence of queries.
+						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
+						Timestamp: time.Now(),
+					}
+				case *pgproto3.Parse:
+					query := strings.Trim(q.Query, " ")
+					chQueryData <- &QueryData{
+						Raw:       query,               // Original query string. Might be single query or sequence of queries.
+						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
+						Timestamp: time.Now(),
+					}
+				default:
 				}
-				chRequestCount++
-				logger.Debugf("%d PG requests queued.", chRequestCount)
 			}
 
 			// Forward to database
@@ -1051,21 +1062,19 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		defer wg.Done()
 
 		// Cache current query executed
-		var request *PgRequest      // PgRequest containing the whole FrontendMessage sent by the client
-		var requestQuery string     // SQL query extracted from the PgRequest
-		var requestQueries []string // SQL query split into sub queries, in case of multi-query query.
-		var commandCount = 0        // Counts the amount of SQL commands responded to by the backend (Multi-query may contain multiple SQL commands)
-		var rowCount = 0            // Counts the amount of rows returned by the backend per command response
-		var queryTime = time.Time{}
+		var queryData *QueryData    // QueryData containing the query string currently worked on between the client and the database
+		var queryTime = time.Time{} // Timestamp when the query finished executing (before transmission of results)
+		var commands = 0            // Amount of SQL commands processed by the backend (A query may contain multiple SQL commands)
+		var rows = 0                // Amount of rows returned by an SQL command
 
 		// Catch potential panics to gracefully log issue with stacktrace
 		defer func() {
 
 			// Log issue
 			if r := recover(); r != nil {
-				q := requestQuery
-				if commandCount < len(requestQueries) {
-					q = requestQueries[commandCount]
+				q := queryData.Raw
+				if commands < len(queryData.Queries) {
+					q = queryData.Queries[commands]
 				}
 				logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
 			}
@@ -1106,17 +1115,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if p.fnMonitoring != nil {
 
 				// Get query data (FrontendMessage), as communication segment has started
-				select {
-				case request = <-chRequest:
-					chRequestCount--
-					switch q := request.Request.(type) {
-					case *pgproto3.Query:
-						requestQuery = strings.Trim(request.Request.(*pgproto3.Query).String, " ")
-						requestQueries = splitMultiQuery(requestQuery)
-					default:
-						logger.Errorf("Request Type '%T' unexpected.", q)
+				if queryData == nil {
+					select {
+					case queryData = <-chQueryData:
+					default: // Still working on the previous query
 					}
-				default: // Still working on the previous query
 				}
 
 				// Act on response depending on type
@@ -1124,29 +1127,32 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.ErrorResponse:
 
 					// Check if amount of responses still matches expected amounts
-					if commandCount >= len(requestQueries) {
+					var query string
+					if commands >= len(queryData.Queries) {
+
+						// Log secondary error
+						logger.Errorf(
+							"Received %d responses, while only %d were expected.",
+							commands+1,
+							len(queryData.Queries),
+						)
 
 						// Get query, prettify and unify for logging
-						_, query := prettify(logger, requestQuery)
+						_, query = prettify(logger, queryData.Raw)
 
-						// Log error
-						logger.Errorf(
-							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commandCount+1, len(requestQueries), query,
-						)
 					} else { // Process response if it is as expected
 
 						// Get query, prettify and unify for logging
-						_, query := prettify(logger, requestQueries[commandCount])
-
-						// Log error
-						logger.Infof(
-							"Response Type '%T': %s\n%s",
-							commandResp,
-							commandResp.Message,
-							"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-						)
+						_, query = prettify(logger, queryData.Queries[commands])
 					}
+
+					// Log error
+					logger.Infof(
+						"Response Type '%T': %s\n%s",
+						commandResp,
+						commandResp.Message,
+						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+					)
 
 				case *pgproto3.EmptyQueryResponse:
 
@@ -1163,25 +1169,27 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Postgres returns one DataRow response per result ROW!
 					// Don't log, because it would bloat the log file.
-					rowCount++
+					rows++
 
 				case *pgproto3.CommandComplete:
 
 					// Make up for skipped DataRow response logs with aggregated DataRow log entry
-					if rowCount > 0 {
-						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, rowCount)
+					if rows > 0 {
+						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, rows)
 					}
 
 					// Check if amount of responses still matches expected amounts
-					if commandCount >= len(requestQueries) {
+					if commands >= len(queryData.Queries) {
 
 						// Get query, prettify and unify for logging
-						_, query := prettify(logger, requestQuery)
+						_, query := prettify(logger, queryData.Raw)
 
 						// Log error
 						logger.Errorf(
 							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commandCount+1, len(requestQueries), query,
+							commands+1,
+							len(queryData.Queries),
+							query,
 						)
 					} else { // Process response if it is as expected
 
@@ -1189,7 +1197,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						logger.Infof("Response Type '%T', logging command.", commandResp)
 
 						// Get query, prettify and unify for logging
-						tables, query := prettify(logger, requestQueries[commandCount])
+						tables, query := prettify(logger, queryData.Queries[commands])
 
 						// Extract row count
 						queryRows := parseRows(logger, commandResp.CommandTag)
@@ -1206,7 +1214,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 							tables,
 							query,
 							queryRows,
-							request.Start,
+							queryData.Timestamp,
 							tExec,
 							tEnd,
 							startupRaw.Parameters["application_name"],
@@ -1217,10 +1225,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					}
 
 					// Reset command's response row counter
-					rowCount = 0
+					rows = 0
 
 					// Increment command counter
-					commandCount++
+					commands++
 
 					// Reset query time for new timing
 					queryTime = time.Time{}
@@ -1233,11 +1241,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.ReadyForQuery:
 
 					// Reset query data (FrontendMessage), as communication segment has come to an end
-					logger.Debugf("Response Type '%T', resetting request data.", commandResp)
-					request = nil
-					requestQuery = ""
-					requestQueries = nil
-					commandCount = 0
+					logger.Debugf("Response Type '%T', resetting query data.", commandResp)
+					queryData = nil
+					commands = 0
 
 				default:
 					logger.Debugf("Response Type '%T'.", commandResp)
@@ -1366,9 +1372,9 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	}
 }
 
-// splitMultiQuery checks whether a query consists out of multiple single queries to be executed by the database
+// splitQueries checks whether a query consists out of multiple single queries to be executed by the database
 // and returns a slice of single queries.
-func splitMultiQuery(sql string) []string {
+func splitQueries(sql string) []string {
 
 	// Split queries by unquoted semicolon
 	quotedSingle := false
