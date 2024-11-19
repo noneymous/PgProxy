@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -239,12 +240,12 @@ func (p *PgReverseProxy) Serve() { // Log termination
 			// Ignore timeout errors
 			var ne net.Error
 			if errors.As(errClient, &ne) && ne.Timeout() {
-				p.log.Infof("Client connection failed: %s", errClient)
+				p.log.Infof("Client connection failed: %s.", errClient)
 				continue // Continue with next connection attempt
 			}
 
 			// Log error
-			p.log.Errorf("Client connection failed: %s", errClient)
+			p.log.Errorf("Client connection failed: %s.", errClient)
 			continue // Continue with next connection attempt
 		}
 
@@ -292,7 +293,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Set deadline initial deadline for client to complete handshake
 	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
 	if errDeadline != nil {
-		logger.Errorf("Setting client deadline failed: %s", errDeadline)
+		logger.Errorf("Setting client deadline failed: %s.", errDeadline)
 	}
 
 	// Log initial message
@@ -379,7 +380,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Read startup message
 		startup, errStartup := clientBackend.ReceiveStartupMessage()
-		if errors.Is(errStartup, io.EOF) { // Connection closed by client
+		if errors.Is(errStartup, io.EOF) || errors.Is(errStartup, syscall.ECONNRESET) { // Connection closed by client
 			logger.Debugf("Client terminated connection.")
 			return
 		} else if errStartup != nil {
@@ -476,7 +477,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Execute SSL handshake
 			clientTls := tls.Server(client, tlsClient)
 			errClientTls := clientTls.Handshake()
-			if errors.Is(errClientTls, io.EOF) { // Connection closed by client
+			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, syscall.ECONNRESET) { // Connection closed by client
 				logger.Debugf("Client terminated connection.")
 				return
 			} else if errors.Is(errClientTls, &ErrCertificate{}) {
@@ -770,7 +771,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			clientErrMsg = ErrInternal
 
 			// Log error and return
-			logger.Errorf("Database startup failed: could not receive startup response: %s", errResponseStartup)
+			logger.Errorf("Database startup failed: could not receive startup response: %s.", errResponseStartup)
 			return
 		}
 
@@ -1032,7 +1033,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
 					// Connection closed by PgProxy
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from client failed: %s", errR)
+					logger.Errorf("Proxying data from client failed: %s.", errR)
 				}
 
 				// Indicate end of communication and return
@@ -1043,7 +1044,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Update deadline for client to show activity
 			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
 			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s", errDeadlineUpdate)
+				logger.Errorf("Updating client deadline failed: %s.", errDeadlineUpdate)
 			}
 
 			// Forwarding query data to database receiver routine
@@ -1075,7 +1076,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errSend != nil {
 
 				// Log error
-				logger.Errorf("Proxying data to database failed: %s", errSend)
+				logger.Errorf("Proxying data to database failed: %s.", errSend)
 
 				// Notify client about issue with backend database
 				notifyClient(&pgconn.PgError{
@@ -1139,11 +1140,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Log error with respective criticality
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
-					logger.Infof("Database terminated connection: %s", errR)
+					logger.Infof("Database terminated connection: %s.", errR)
 				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
 					// Connection closed by PgProxy
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from server failed: %s", errR)
+					logger.Errorf("Proxying data from server failed: %s.", errR)
 
 					// Notify client about issue with backend database
 					notifyClient(&pgconn.PgError{
@@ -1304,7 +1305,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
 				} else { // Unexpected error
-					logger.Errorf("Proxying data to client failed: %s", errSend)
+					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
 
 				// Indicate end of communication and return
@@ -1315,7 +1316,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Update deadline for client to show activity
 			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
 			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s", errDeadlineUpdate)
+				logger.Errorf("Updating client deadline failed: %s.", errDeadlineUpdate)
 			}
 
 			// Exit goroutine if necessary
