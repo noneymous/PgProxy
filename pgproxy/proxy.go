@@ -411,17 +411,26 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.CancelRequest:
 
 			// Prepare cancellation request
-			key := pgproto3.BackendKeyData{
+			keyData := pgproto3.BackendKeyData{
 				ProcessID: m.ProcessID,
 				SecretKey: m.SecretKey,
 			}
 
+			// Get key
+			k := generateKey(&keyData)
+
 			// Get connection to cancel by key
-			pgConn, okPgConn := p.connectionMap.Get(generateKey(&key))
+			pgConn, okPgConn := p.connectionMap.Get(k)
 			if !okPgConn {
-				logger.Infof("Cancel request for unknown connection '%T'.", key)
+				logger.Infof("Cancel request for unknown connection '%T'.", keyData)
 				return // Abort in case of communication error
 			}
+
+			// Make sure entry is cleaned from map after database connection is terminated
+			defer func() {
+				p.connectionMap.Remove(k)
+				p.logConnections()
+			}()
 
 			// Prepare cancel data
 			buf := make([]byte, 16)
@@ -1011,7 +1020,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	go func() {
 
 		// Log termination
-		defer func() { logger.Debugf("Terminated client receiver.") }()
+		defer func() { logger.Debugf("Client receiver terminated.") }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
@@ -1129,7 +1138,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	go func() {
 
 		// Log termination
-		defer func() { logger.Infof("Terminated database receiver.") }()
+		defer func() { logger.Infof("Database receiver termianted.") }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
@@ -1404,7 +1413,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}()
 
 	// Log waiting
-	logger.Debugf("Waiting for remaining goroutines.")
+	logger.Debugf("Waiting for remaining receiver.")
 
 	// Close client and database connections to resolve potentially blocking Receive() calls in goroutines
 	_ = connDatabase.Close()
