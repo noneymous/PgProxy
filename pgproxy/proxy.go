@@ -1044,7 +1044,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Prepare query cache for extended query flow / prepared statement,
 		// where previous queries might be referenced and reused
 		queryCache := make(map[string]string)
-		previousWasParse := false
+
+		// Prepare synced flag indicating whether database response can be expected.
+		// Sending query data gain before database is ready to would get the query data channel stuck.
+		synced := false
 
 		// Loop and listen
 		for {
@@ -1088,7 +1091,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
 						Timestamp: time.Now(),
 					}
-					previousWasParse = false
 				case *pgproto3.Parse:
 					logger.Debugf("Request  Type '%T', sending query data.", r)
 					query := strings.Trim(q.Query, " ")
@@ -1098,9 +1100,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Timestamp: time.Now(),
 					}
 					queryCache[q.Name] = query
-					previousWasParse = true
+					synced = false
 				case *pgproto3.Bind: // New command with previous query
-					if !previousWasParse { // Bind right after Parse would send the same queryData again and get the channel stuck
+					if synced { // Bind right after Parse would send the same queryData again and get the channel stuck. Sync needs to be observed first
 						logger.Debugf("Request  Type '%T', sending query data.", r)
 						query, okQuery := queryCache[q.PreparedStatement]
 						if okQuery {
@@ -1112,9 +1114,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 							}
 						}
 					}
-					previousWasParse = false
+					synced = false
+				case *pgproto3.Sync:
+					synced = true
 				default:
-					previousWasParse = false
 				}
 
 				// Log branch completion, to see whether something got stuck
