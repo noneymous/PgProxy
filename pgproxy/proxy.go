@@ -1090,6 +1090,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					}
 					previousWasParse = false
 				case *pgproto3.Parse:
+					logger.Debugf("Request  Type '%T', sending query data.", r)
 					query := strings.Trim(q.Query, " ")
 					chQueryData <- &QueryData{
 						Raw:       query,               // Original query string. Might be single query or sequence of queries.
@@ -1100,6 +1101,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					previousWasParse = true
 				case *pgproto3.Bind: // New command with previous query
 					if !previousWasParse { // Bind right after Parse would send the same queryData again and get the channel stuck
+						logger.Debugf("Request  Type '%T', sending query data.", r)
 						query, okQuery := queryCache[q.PreparedStatement]
 						if okQuery {
 							query = strings.Trim(query, " ")
@@ -1114,6 +1116,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				default:
 					previousWasParse = false
 				}
+
+				// Log branch completion, to see whether something got stuck
+				logger.Debugf("Request  Type '%T' done.", r)
 			}
 
 			// Forward to database
