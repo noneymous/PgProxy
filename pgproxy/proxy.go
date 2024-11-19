@@ -73,6 +73,7 @@ type PgReverseProxy struct {
 	ctxCancelFunc context.CancelFunc // Cancel function for context
 
 	fnMonitoring func(
+		loggerClient scanUtils.Logger,
 		dbName string,
 		dbUser string,
 		dbTables []string,
@@ -154,6 +155,7 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 
 // RegisterMonitoring can be used to configure a custom function for user activity logging or monitoring
 func (p *PgReverseProxy) RegisterMonitoring(f func(
+	loggerClient scanUtils.Logger,
 	dbName string,
 	dbUser string,
 	dbTables []string,
@@ -1317,6 +1319,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 							tExec = queryTime
 						}
 						errMonitoring := p.fnMonitoring(
+							logger,
 							startupRaw.Parameters["database"],
 							startupRaw.Parameters["user"],
 							tables,

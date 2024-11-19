@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/noneymous/PgProxy/pgproxy"
+	scanUtils "github.com/siemens/GoScans/utils"
 	"log"
 	"strings"
 	"time"
@@ -54,6 +55,7 @@ func main() {
 
 	// Register monitoring function (optional)
 	pgProxy.RegisterMonitoring(func(
+		loggerClient scanUtils.Logger, // Internal logger from PgProxy, within the context of a client connection
 		dbName string,
 		dbUser string,
 		dbTables []string,
