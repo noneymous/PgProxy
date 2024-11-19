@@ -1282,6 +1282,29 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
 
+					// Update connection name in cached active connections
+					if commandResp.Name == "application_name" && commandResp.Value != "" {
+
+						// Update application name
+						startupRaw.Parameters["application_name"] = commandResp.Value
+
+						// Update cached information
+						if keyData != nil {
+
+							// Get key
+							k := generateKey(keyData)
+
+							// Store connection under key
+							p.connectionMap.Set(k, PgConn{
+								Pid:        keyData.ProcessID,
+								Sid:        keyData.SecretKey,
+								User:       startupRaw.Parameters["user"],
+								Client:     startupRaw.Parameters["application_name"],
+								Connection: connDatabase,
+							})
+						}
+					}
+
 					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
 					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", commandResp, commandResp.Name, commandResp.Value)
 
@@ -1511,15 +1534,19 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		query = strings.Join(lines, "\n")
 	}
 
+	// Prepare warn flag to avoid duplicate reporting
+	warned := false
+
 	// Tokenize query
 	tokens, errTokenizer := lexer.Tokenize(query)
 	if errTokenizer != nil {
+		warned = true
 		logger.Warningf(
-			"Could not tokenize query: '%s'\n%s",
+			"Could not tokenize query: %s\n%s",
 			errTokenizer,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
-		return
+		// Warn about issue, but continue
 	}
 
 	// Search token tree for FROM tables names
@@ -1530,13 +1557,14 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 
 	// Parse query clauses from tokens
 	tokensParsed, errParse := parser.Parse(tokens, options)
-	if errParse != nil {
+	if errParse != nil && !warned {
+		warned = true
 		logger.Warningf(
-			"Could not parse query: '%s'\n%s",
+			"Could not parse query: %s\n%s",
 			errParse,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
-		return
+		// Warn about issue, but continue
 	}
 
 	// Format parsed tokens into buffer
@@ -1549,19 +1577,33 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		}
 	}
 
+	// Log formatting issue
+	if errFormat != nil && !warned {
+		warned = true
+		logger.Warningf(
+			"Could not format query: %s\n%s",
+			errFormat,
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+		)
+		// Warn about issue, but continue
+	}
+
 	// Get formatted sql string
 	sql = sqlBuf.String()
 
 	// Compare if formatted query still has the same logic as input
 	valid := sqlfmt.CompareSemantic(query, sql)
-
-	// Reset formatted SQL string to original input if there was an error
-	if !valid || errFormat != nil {
+	if !valid && !warned {
+		warned = true
 		logger.Warningf(
-			"Could not format query: '%s'\n%s",
-			errFormat,
+			"Could not prettify query, output diverges:\n%s",
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
+		// Warn about issue, but continue
+	}
+
+	// Reset formatted SQL string to original input if there was an error
+	if !valid || errFormat != nil || errParse != nil || errTokenizer != nil {
 		sql = query
 	}
 
