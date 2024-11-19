@@ -505,6 +505,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				logger.Debugf("Client terminated connection.")
 				return
 			} else if errors.Is(errClientTls, &ErrCertificate{}) {
+
+				// Prepare error to return to the client
+				clientErrMsg = &pgconn.PgError{
+					Code:    "FATAL",
+					Message: "SSL connection requires SNI data",
+				}
+
+				// Log issue andn return
 				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
 				return
 			} else if errClientTls != nil {
