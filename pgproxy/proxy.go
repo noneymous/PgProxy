@@ -419,7 +419,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Get connection to cancel by key
 			pgConn, okPgConn := p.connectionMap.Get(generateKey(&key))
 			if !okPgConn {
-				logger.Errorf("Cancel request failed: Unknown connection '%T'.", key)
+				logger.Infof("Cancel request for unknown connection '%T'.", key)
 				return // Abort in case of communication error
 			}
 
@@ -433,20 +433,32 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Send cancel request on connection
 			_, errWrite := pgConn.Connection.Write(buf)
 			if errWrite != nil {
-				logger.Errorf("Cancel request failed: %s.", errWrite)
-				return // Abort in case of communication error
+				var opError *net.OpError
+				if errors.As(errWrite, &opError) {
+					// Ignore operational errors
+				} else {
+					logger.Errorf("Cancel request failed: %s.", errWrite)
+					return // Abort in case of communication error
+				}
 			}
 
 			// Read cancel response from connection
 			_, errRead := pgConn.Connection.Read(buf)
-			if errRead != io.EOF {
-				logger.Errorf("Cancel request failed: %s.", errRead)
-				return // Abort in case of communication error
+			if errRead != nil {
+				var opError *net.OpError
+				if errors.As(errWrite, &opError) {
+					// Ignore operational errors
+				} else if errRead != io.EOF {
+					// Ignore read error
+				} else {
+					logger.Errorf("Cancel request failed: %s.", errRead)
+					return // Abort in case of communication error
+				}
 			}
 
 			// Log success and abort further communication
 			logger.Infof("Cancel request successful.")
-			return // Abort in case of communication error
+			return
 
 		case *pgproto3.SSLRequest:
 
@@ -1018,6 +1030,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			return
 		}()
 
+		// Prepare query cache for extended query flow / prepared statement,
+		// where previous queries might be referenced and reused
+		queryCache := make(map[string]string)
+
 		// Loop and listen
 		for {
 
@@ -1067,6 +1083,17 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
 						Timestamp: time.Now(),
 					}
+					queryCache[q.Name] = query
+				case *pgproto3.Bind: // New command with previous query
+					query, okQuery := queryCache[q.PreparedStatement]
+					if okQuery {
+						query = strings.Trim(query, " ")
+						chQueryData <- &QueryData{
+							Raw:       query,               // Original query string. Might be single query or sequence of queries.
+							Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
+							Timestamp: time.Now(),
+						}
+					}
 				default:
 				}
 			}
@@ -1109,7 +1136,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		defer wg.Done()
 
 		// Cache current query executed
-		var queryData *QueryData    // QueryData containing the query string currently worked on between the client and the database
+		var queryData = &QueryData{ // QueryData containing the query string currently worked on between the client and the database
+			Raw:       "",
+			Queries:   []string{},
+			Timestamp: time.Time{},
+		}
 		var queryTime = time.Time{} // Timestamp when the query finished executing (before transmission of results)
 		var commands = 0            // Amount of SQL commands processed by the backend (A query may contain multiple SQL commands)
 		var rows = 0                // Amount of rows returned by an SQL command
@@ -1119,14 +1150,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Log issue
 			if r := recover(); r != nil {
-				if queryData == nil {
-					logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
-				} else {
+				if queryData != nil {
 					q := queryData.Raw
 					if commands < len(queryData.Queries) {
 						q = queryData.Queries[commands]
 					}
 					logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
+				} else {
+					logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 				}
 			}
 
@@ -1166,7 +1197,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if p.fnMonitoring != nil {
 
 				// Get query data (FrontendMessage), as communication segment has started
-				if queryData == nil {
+				if queryData.Raw == "" && len(queryData.Queries) == 0 { // Don't get next query until query data is reset by ReadyForQuery
 					select {
 					case queryData = <-chQueryData:
 					default: // Still working on the previous query
@@ -1197,7 +1228,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						_, query = prettify(logger, queryData.Queries[commands])
 					}
 
-					// Log error
+					// Log response type
 					logger.Infof(
 						"Response Type '%T': %s\n%s",
 						commandResp,
@@ -1316,7 +1347,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Reset query data (FrontendMessage), as communication segment has come to an end
 					logger.Debugf("Response Type '%T', resetting query data.", commandResp)
-					queryData = nil
+					queryData = &QueryData{
+						Raw:       "",
+						Queries:   []string{},
+						Timestamp: time.Time{},
+					}
 					commands = 0
 
 				default:
