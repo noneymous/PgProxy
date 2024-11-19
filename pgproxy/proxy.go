@@ -48,6 +48,7 @@ func (e *ErrCertificate) Error() string {
 type PgConn struct {
 	Pid        uint32
 	Sid        uint32
+	Database   string
 	User       string
 	Client     string
 	Connection net.Conn
@@ -981,6 +982,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		p.connectionMap.Set(k, PgConn{
 			Pid:        keyData.ProcessID,
 			Sid:        keyData.SecretKey,
+			Database:   startupRaw.Parameters["database"],
 			User:       startupRaw.Parameters["user"],
 			Client:     startupRaw.Parameters["application_name"],
 			Connection: connDatabase,
@@ -1042,6 +1044,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Prepare query cache for extended query flow / prepared statement,
 		// where previous queries might be referenced and reused
 		queryCache := make(map[string]string)
+		previousWasParse := false
 
 		// Loop and listen
 		for {
@@ -1085,6 +1088,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
 						Timestamp: time.Now(),
 					}
+					previousWasParse = false
 				case *pgproto3.Parse:
 					query := strings.Trim(q.Query, " ")
 					chQueryData <- &QueryData{
@@ -1093,17 +1097,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Timestamp: time.Now(),
 					}
 					queryCache[q.Name] = query
+					previousWasParse = true
 				case *pgproto3.Bind: // New command with previous query
-					query, okQuery := queryCache[q.PreparedStatement]
-					if okQuery {
-						query = strings.Trim(query, " ")
-						chQueryData <- &QueryData{
-							Raw:       query,               // Original query string. Might be single query or sequence of queries.
-							Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-							Timestamp: time.Now(),
+					if !previousWasParse { // Bind right after Parse would send the same queryData again and get the channel stuck
+						query, okQuery := queryCache[q.PreparedStatement]
+						if okQuery {
+							query = strings.Trim(query, " ")
+							chQueryData <- &QueryData{
+								Raw:       query,               // Original query string. Might be single query or sequence of queries.
+								Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
+								Timestamp: time.Now(),
+							}
 						}
 					}
+					previousWasParse = false
 				default:
+					previousWasParse = false
 				}
 			}
 
@@ -1245,7 +1254,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 					)
 
-				case *pgproto3.EmptyQueryResponse:
+				case *pgproto3.EmptyQueryResponse: // Empty query string
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
 					logger.Debugf("Response Type '%T'.", commandResp)
@@ -1342,6 +1351,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 							p.connectionMap.Set(k, PgConn{
 								Pid:        keyData.ProcessID,
 								Sid:        keyData.SecretKey,
+								Database:   startupRaw.Parameters["database"],
 								User:       startupRaw.Parameters["user"],
 								Client:     startupRaw.Parameters["application_name"],
 								Connection: connDatabase,
@@ -1429,12 +1439,13 @@ func (p *PgReverseProxy) logConnections() {
 	if p.connectionMap.Count() > 0 {
 		for _, v := range p.connectionMap.Items() {
 			msg += fmt.Sprintf(
-				"\n    Pid: %-5d | Sid: %-10d | Origin: %-21s | Client: '%s' \t| User: %s",
+				"\n    Pid: %-5d | Sid: %-10d | Origin: %-17s\t| Db: %-10s | User: %-25s \t| Client: '%s'",
 				v.Pid,
 				v.Sid,
 				v.Connection.RemoteAddr(),
-				v.Client,
+				v.Database,
 				v.User,
+				v.Client,
 			)
 		}
 		p.log.Debugf(msg)
