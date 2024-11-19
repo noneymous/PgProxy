@@ -1119,11 +1119,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Log issue
 			if r := recover(); r != nil {
-				q := queryData.Raw
-				if commands < len(queryData.Queries) {
-					q = queryData.Queries[commands]
+				if queryData == nil {
+					logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
+				} else {
+					q := queryData.Raw
+					if commands < len(queryData.Queries) {
+						q = queryData.Queries[commands]
+					}
+					logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
 				}
-				logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
 			}
 
 			// Trigger end of communication and return
