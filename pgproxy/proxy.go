@@ -316,7 +316,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Get listener config based on SNI
 			listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
 			if !okListenerConfig {
-				return nil, &ErrCertificate{Message: fmt.Sprintf("no certificate for '%s'", t.ServerName)}
+				if t.ServerName == "" {
+					return nil, &ErrCertificate{Message: fmt.Sprintf("no default certificate for empty SNI")}
+				} else {
+					return nil, &ErrCertificate{Message: fmt.Sprintf("no certificate for SNI '%s'", t.ServerName)}
+				}
 			}
 
 			// Return related certificate
@@ -387,7 +391,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			logger.Debugf("Client terminated connection.")
 			return
 		} else if errStartup != nil {
-			logger.Errorf("Client startup failed: %s.", errStartup)
+
+			// Set error details to be forwarded to client
+			clientErrMsg = &pgconn.PgError{
+				Code:    "FATAL",
+				Message: "Invalid startup message",
+			}
+
+			logger.Debugf("Client startup failed: %s.", errStartup)
 			return
 		}
 
@@ -499,21 +510,24 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Execute SSL handshake
+			var errCertificate *ErrCertificate
 			clientTls := tls.Server(client, tlsClient)
 			errClientTls := clientTls.Handshake()
 			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, syscall.ECONNRESET) { // Connection closed by client
+				_ = clientTls.Close()
 				logger.Debugf("Client terminated connection.")
 				return
-			} else if errors.Is(errClientTls, &ErrCertificate{}) {
+			} else if errors.As(errClientTls, &errCertificate) {
 
 				// Prepare error to return to the client
 				clientErrMsg = &pgconn.PgError{
 					Code:    "FATAL",
-					Message: "SSL connection requires SNI data",
+					Message: "SSL connection with valid SNI required",
 				}
 
 				// Log issue andn return
-				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
+				_ = clientTls.Close()
+				logger.Infof("Client startup failed during SSL handshake: %s.", errClientTls)
 				return
 			} else if errClientTls != nil {
 				_ = clientTls.Close()
@@ -1620,7 +1634,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	if errTokenizer != nil {
 		warned = true
 		logger.Warningf(
-			"Could not tokenize query: %s\n%s",
+			"Could not tokenize query: %s:\n%s",
 			errTokenizer,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
@@ -1638,7 +1652,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	if errParse != nil && !warned {
 		warned = true
 		logger.Warningf(
-			"Could not parse query: %s\n%s",
+			"Could not parse query: %s:\n%s",
 			errParse,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
@@ -1659,7 +1673,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	if errFormat != nil && !warned {
 		warned = true
 		logger.Warningf(
-			"Could not format query: %s\n%s",
+			"Could not format query: %s:\n%s",
 			errFormat,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
@@ -1703,6 +1717,9 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 // parseRows extracts the number of affected rows from a response's command tag
 func parseRows(logger scanUtils.Logger, tag []byte) int {
 	queryTag := string(tag)
+	if strings.ToUpper(queryTag) == "DISCARD ALL" {
+		return 0
+	}
 	queryTagFragments := strings.SplitN(queryTag, " ", -1)
 	queryRowsFragment := ""
 	if len(queryTagFragments) == 1 {
