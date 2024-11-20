@@ -54,6 +54,7 @@ type PgConn struct {
 	User       string
 	Client     string
 	Connection net.Conn
+	Timestamp  time.Time
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
@@ -1029,6 +1030,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		User:       startupRaw.Parameters["user"],
 		Client:     startupRaw.Parameters["application_name"],
 		Connection: connDatabase,
+		Timestamp:  time.Now(),
 	})
 
 	// Make sure entry is cleaned from map after database connection is terminated
@@ -1389,18 +1391,19 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Update connection name in cached active connections
 					if commandResp.Name == "application_name" && commandResp.Value != "" {
 
-						// Update application name
-						startupRaw.Parameters["application_name"] = commandResp.Value
+						// Get previous data
+						pgConn, pgConnOk := p.connectionMap.Get(k)
+						if !pgConnOk {
+							logger.Errorf("Could not get connection data '%s'", k)
+						} else {
 
-						// Update cached information
-						p.connectionMap.Set(k, PgConn{
-							Pid:        keyData.ProcessID,
-							Sid:        keyData.SecretKey,
-							Database:   startupRaw.Parameters["database"],
-							User:       startupRaw.Parameters["user"],
-							Client:     startupRaw.Parameters["application_name"],
-							Connection: connDatabase,
-						})
+							// Update application name
+							startupRaw.Parameters["application_name"] = commandResp.Value
+							pgConn.Client = commandResp.Value
+
+							// Update cached information
+							p.connectionMap.Set(k, pgConn)
+						}
 					}
 
 					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
@@ -1482,10 +1485,19 @@ func (p *PgReverseProxy) logConnections() {
 	msg := "Active database connections:"
 	if p.connectionMap.Count() > 0 {
 		for _, v := range p.connectionMap.Items() {
+			user := v.User
+			if len(user) > 15 {
+				user = user[:12] + "..."
+			}
+			client := v.Client
+			if len(client) > 35 {
+				client = client[:32] + "..."
+			}
 			msg += fmt.Sprintf(
-				"\n    Pid: %-5d | Sid: %-10d | Origin: %-17s\t| Db: %-10s | User: %-25s \t| Client: '%s'",
+				"\n    Pid: %-5d | Sid: %-10d | Started: %-19s | Origin: %-17s | Db: %-10s | User: %-15s | Client: '%-35s'",
 				v.Pid,
 				v.Sid,
+				v.Timestamp.Format("2006-01-02 15:04:05"),
 				v.Connection.RemoteAddr(),
 				v.Database,
 				v.User,
