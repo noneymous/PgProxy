@@ -461,11 +461,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				return // Abort in case of communication error
 			}
 
-			// Make sure entry is cleaned from map after database connection is terminated
-			defer func() {
-				p.connectionMap.Remove(k)
-			}()
-
 			// Prepare cancel data
 			buf := make([]byte, 16)
 			binary.BigEndian.PutUint32(buf[0:4], 16)
@@ -587,7 +582,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Log situation and return
-			logger.Infof("Client connection without SNI cannot be dispatched, there is no default database.")
+			logger.Infof("Client connection without SNI cannot be dispatched, there is no default database server.")
 			return
 		} else {
 
@@ -598,22 +593,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Log situation and return
-			logger.Infof("Client connection without SSL/SNI cannot be dispatched, there is no default database.")
+			logger.Infof("Client connection without SSL/SNI cannot be dispatched, there is no default database server.")
 			return
 		}
 	}
 
 	// Log target database derived from connection settings
 	if !isSsl {
-		logger.Debugf("Client connection without SSL dispatching to DEFAULT database.")
+		logger.Debugf("Client connection without SSL dispatching to DEFAULT database server.")
 	} else if sni == "" {
-		logger.Debugf("Client connection without SNI dispatching to DEFAULT database.")
+		logger.Debugf("Client connection without SNI dispatching to DEFAULT database server.")
 	} else {
-		logger.Debugf("Client connection dispatching to database '%s'.", sni)
+		logger.Debugf("Client connection dispatching to database server '%s'.", sni)
 	}
 
 	// Log user requesting connection
-	logger.Debugf("Client connection authenticating as '%s'.", startupRaw.Parameters["user"])
+	logger.Debugf("Client connection to '%s' as '%s'.", startupRaw.Parameters["database"], startupRaw.Parameters["user"])
 
 	// Request password from client
 	logger.Debugf("Requesting authentication password from client.")
@@ -647,12 +642,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Prepare database target address
 	listenerConfig, okListenerConfig := p.listenerConfigs[sni]
 	if !okListenerConfig {
-		logger.Errorf("Database startup failed: no database configuration for '%s'.", sni)
+		logger.Errorf("Database startup failed: no database server configuration for SNI '%s'.", sni)
 		return // Abort in case of communication error
 	}
 
 	// Log database selection
-	logger.Debugf("Proxying to database '%s'.", listenerConfig.Database.Host)
+	logger.Debugf("Proxying to database server '%s'.", listenerConfig.Database.Host)
 
 	// Build address for connection
 	address := fmt.Sprintf("%s:%d", listenerConfig.Database.Host, listenerConfig.Database.Port)
@@ -668,7 +663,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log error and return
-		logger.Errorf("Database startup failed: could not connect to database '%s': %s.", address, errDatabase)
+		logger.Errorf("Database startup failed: could not connect to database server '%s': %s.", address, errDatabase)
 		return // Abort in case of communication error
 	}
 
@@ -1035,7 +1030,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Make sure entry is cleaned from map after database connection is terminated
 	defer func() {
+		logger.Debugf("Removing cached connection details.")
 		p.connectionMap.Remove(k)
+		p.connectionsLogTicker.Reset(intervalConnectionsLog)
+		p.logConnections()
 	}()
 
 	// Print current connections
@@ -1068,6 +1066,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Log termination
 		defer func() { logger.Debugf("Client receiver terminated.") }()
 
+		// Indicate end of communication to unblock parent goroutine
+		defer func() { chDone <- struct{}{} }()
+
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
 		defer wg.Done()
@@ -1079,10 +1080,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if r := recover(); r != nil {
 				logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 			}
-
-			// Trigger end of communication and return
-			chDone <- struct{}{}
-			return
 		}()
 
 		// Prepare query cache for extended query flow / prepared statement,
@@ -1093,7 +1090,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Sending query data gain before database is ready to would get the query data channel stuck.
 		synced := false
 
-		// Loop and listen
+		// Loop and listen for client requests
 		for {
 
 			// Receive from client
@@ -1111,8 +1108,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Errorf("Proxying data from client failed: %s.", errR)
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end client receiver
 				return
 			}
 
@@ -1181,8 +1177,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					Message: errSend.Error(),
 				})
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end client receiver
 				return
 			}
 
@@ -1200,6 +1195,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Log termination
 		defer func() { logger.Infof("Database receiver terminated.") }()
+
+		// Indicate end of communication to unblock parent goroutine
+		defer func() { chDone <- struct{}{} }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
@@ -1230,13 +1228,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 				}
 			}
-
-			// Trigger end of communication and return
-			chDone <- struct{}{}
-			return
 		}()
 
-		// Loop and listen
+		// Loop and listen for database responses
 		for {
 
 			// Receive from database
@@ -1258,8 +1252,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					})
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end database receiver
 				return
 			}
 
@@ -1436,8 +1429,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end database receiver
 				return
 			}
 
@@ -1462,7 +1454,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			select {
 			case <-p.ctx.Done():
 				return
-
 			case _ = <-chDone:
 				return
 			}
@@ -1475,6 +1466,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Close client and database connections to resolve potentially blocking Receive() calls in goroutines
 	_ = connDatabase.Close()
 	_ = client.Close()
+
+	// Read remaining done signal to unblock remaining receiver goroutine. There are always two,
+	// one listening for client communication and one listening for database communication.
+	<-chDone
 
 	// Wait for all goroutines
 	wg.Wait()
@@ -1494,7 +1489,7 @@ func (p *PgReverseProxy) logConnections() {
 				client = client[:32] + "..."
 			}
 			msg += fmt.Sprintf(
-				"\n    Pid: %-5d | Sid: %-10d | Started: %-19s | Origin: %-17s | Db: %-10s | User: %-15s | Client: '%-35s'",
+				"\n    Pid%-5d, Sid%-10d | Started: %-19s | Origin: %-17s | Db: %-10s | User: %-15s | Client: '%-35s'",
 				v.Pid,
 				v.Sid,
 				v.Timestamp.Format("2006-01-02 15:04:05"),
