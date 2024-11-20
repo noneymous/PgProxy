@@ -29,6 +29,8 @@ import (
 	"time"
 )
 
+const intervalConnectionsLog = time.Second * 30
+
 // ErrInternal defines an error message to be returned to the client if there was some internal error
 // Other errors, raised by the database, should be directly returned to the client.
 var ErrInternal = &pgconn.PgError{
@@ -57,7 +59,7 @@ type PgConn struct {
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
 // connections and redirecting them to configured database servers, based on SNIs indicated by the client.
 type PgReverseProxy struct {
-	log                scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
+	logger             scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
 	listener           net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
 	listenerPort       uint             // PgProxy port to listen on
 	listenerForceSsl   bool             // PgProxy flag whether to force SSL or allow plaintext connections
@@ -71,6 +73,8 @@ type PgReverseProxy struct {
 	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
 	ctxCancelFunc context.CancelFunc // Cancel function for context
+
+	connectionsLogTicker *time.Ticker // Ticker regularly logging currently active connections
 
 	fnMonitoring func(
 		loggerClient scanUtils.Logger,
@@ -88,7 +92,7 @@ type PgReverseProxy struct {
 
 // Init initializes the Postgres reverse proxy
 func Init(
-	log scanUtils.Logger,
+	logger scanUtils.Logger,
 	listenerPort uint,
 	listenerForceSsl bool, // Whether to reject plain text connections
 	listenerDefaultSni bool, // Whether to reject SSL connections without SNI. Without SNI the first SNI configuration would be applied as the default.
@@ -106,17 +110,33 @@ func Init(
 
 	// Prepare PgProxy
 	pgProxy := PgReverseProxy{
-		log:                log,
-		listener:           listener,
-		listenerPort:       listenerPort,
-		listenerForceSsl:   listenerForceSsl,
-		listenerDefaultSni: listenerDefaultSni,
-		listenerTimeout:    listenerTimeout,
-		listenerConfigs:    make(map[string]Sni),
-		ctx:                ctx,
-		ctxCancelFunc:      ctxCancel,
-		connectionMap:      cmap.New[PgConn](),
+		logger:               logger,
+		listener:             listener,
+		listenerPort:         listenerPort,
+		listenerForceSsl:     listenerForceSsl,
+		listenerDefaultSni:   listenerDefaultSni,
+		listenerTimeout:      listenerTimeout,
+		listenerConfigs:      make(map[string]Sni),
+		ctx:                  ctx,
+		ctxCancelFunc:        ctxCancel,
+		connectionsLogTicker: time.NewTicker(intervalConnectionsLog),
+		connectionMap:        cmap.New[PgConn](),
 	}
+
+	// Launch background routine regularly printing currently active connections
+	go func() {
+		pgProxy.logger.Debugf("Connections logger started.")
+		pgProxy.logConnections()
+		for {
+			select {
+			case <-pgProxy.ctx.Done():
+				pgProxy.logger.Debugf("Connections logger terminated.")
+				return
+			case <-pgProxy.connectionsLogTicker.C:
+				pgProxy.logConnections()
+			}
+		}
+	}()
 
 	// Return initialized PgProxy
 	return &pgProxy, nil
@@ -173,9 +193,9 @@ func (p *PgReverseProxy) RegisterMonitoring(f func(
 func (p *PgReverseProxy) Stop() {
 
 	// Log shutdown
-	p.log.Infof("PgProxy shutting down.")
+	p.logger.Infof("PgProxy shutting down.")
 	if p.connectionCtr > 0 {
-		p.log.Debugf("PgProxy has %d active connections left.", p.connectionCtr)
+		p.logger.Debugf("PgProxy has %d active connections left.", p.connectionCtr)
 	}
 
 	// Cancel context
@@ -186,7 +206,7 @@ func (p *PgReverseProxy) Stop() {
 
 	// Wait for active connections to be terminated
 	p.wg.Wait()
-	p.log.Debugf("PgProxy stopped.")
+	p.logger.Debugf("PgProxy stopped.")
 }
 
 // Serve listens for incoming connections and processes them in an asynchronous goroutine
@@ -194,7 +214,7 @@ func (p *PgReverseProxy) Serve() { // Log termination
 
 	// Check if at least one certificate is set
 	if len(p.listenerConfigs) == 0 {
-		p.log.Errorf("PgProxy certificates not configured.")
+		p.logger.Errorf("PgProxy certificates not configured.")
 		return
 	} else {
 		msg := fmt.Sprintf("PgProxy certificates configured on port %d:", p.listenerPort)
@@ -225,7 +245,7 @@ func (p *PgReverseProxy) Serve() { // Log termination
 				msg += fmt.Sprintf("\n          Subj Alt IPs  : %s", subjAltIps)
 			}
 		}
-		p.log.Debugf(msg)
+		p.logger.Debugf(msg)
 	}
 
 	// Continuously listen for incoming connections
@@ -243,12 +263,12 @@ func (p *PgReverseProxy) Serve() { // Log termination
 			// Ignore timeout errors
 			var ne net.Error
 			if errors.As(errClient, &ne) && ne.Timeout() {
-				p.log.Infof("Client connection failed: %s.", errClient)
+				p.logger.Infof("Client connection failed: %s.", errClient)
 				continue // Continue with next connection attempt
 			}
 
 			// Log error
-			p.log.Errorf("Client connection failed: %s.", errClient)
+			p.logger.Errorf("Client connection failed: %s.", errClient)
 			continue // Continue with next connection attempt
 		}
 
@@ -278,7 +298,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	uuid := shortuuid.New()[0:10] // Shorten uuid, doesn't need to be that long
 
 	// Get tagged logger for connection stream
-	logger := scanUtils.NewTaggedLogger(p.log, uuid)
+	logger := scanUtils.NewTaggedLogger(p.logger, uuid)
 
 	// Log final message for this interaction
 	defer func() { logger.Infof("Proxying communication ended.") }()
@@ -443,7 +463,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Make sure entry is cleaned from map after database connection is terminated
 			defer func() {
 				p.connectionMap.Remove(k)
-				p.logConnections()
 			}()
 
 			// Prepare cancel data
@@ -997,29 +1016,28 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	logger.Infof("Caching connection details.")
 
 	// Cache key data and associated database connection if available
+	k := shortuuid.New()[0:10] // Chose random value if no key data is available
 	if keyData != nil {
-
-		// Get key
-		k := generateKey(keyData)
-
-		// Store connection under key
-		p.connectionMap.Set(k, PgConn{
-			Pid:        keyData.ProcessID,
-			Sid:        keyData.SecretKey,
-			Database:   startupRaw.Parameters["database"],
-			User:       startupRaw.Parameters["user"],
-			Client:     startupRaw.Parameters["application_name"],
-			Connection: connDatabase,
-		})
-
-		// Make sure entry is cleaned from map after database connection is terminated
-		defer func() {
-			p.connectionMap.Remove(k)
-			p.logConnections()
-		}()
+		k = generateKey(keyData)
 	}
 
-	// Log currently fully established connections
+	// Store connection under key
+	p.connectionMap.Set(k, PgConn{
+		Pid:        keyData.ProcessID, // Might be 0 if no key data is available
+		Sid:        keyData.SecretKey, // Might be 0 if no key data is available
+		Database:   startupRaw.Parameters["database"],
+		User:       startupRaw.Parameters["user"],
+		Client:     startupRaw.Parameters["application_name"],
+		Connection: connDatabase,
+	})
+
+	// Make sure entry is cleaned from map after database connection is terminated
+	defer func() {
+		p.connectionMap.Remove(k)
+	}()
+
+	// Print current connections
+	p.connectionsLogTicker.Reset(intervalConnectionsLog)
 	p.logConnections()
 
 	/////////////////////////////////////////////////////////////
@@ -1179,7 +1197,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	go func() {
 
 		// Log termination
-		defer func() { logger.Infof("Database receiver termianted.") }()
+		defer func() { logger.Infof("Database receiver terminated.") }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
@@ -1375,21 +1393,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						startupRaw.Parameters["application_name"] = commandResp.Value
 
 						// Update cached information
-						if keyData != nil {
-
-							// Get key
-							k := generateKey(keyData)
-
-							// Store connection under key
-							p.connectionMap.Set(k, PgConn{
-								Pid:        keyData.ProcessID,
-								Sid:        keyData.SecretKey,
-								Database:   startupRaw.Parameters["database"],
-								User:       startupRaw.Parameters["user"],
-								Client:     startupRaw.Parameters["application_name"],
-								Connection: connDatabase,
-							})
-						}
+						p.connectionMap.Set(k, PgConn{
+							Pid:        keyData.ProcessID,
+							Sid:        keyData.SecretKey,
+							Database:   startupRaw.Parameters["database"],
+							User:       startupRaw.Parameters["user"],
+							Client:     startupRaw.Parameters["application_name"],
+							Connection: connDatabase,
+						})
 					}
 
 					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
@@ -1481,10 +1492,10 @@ func (p *PgReverseProxy) logConnections() {
 				v.Client,
 			)
 		}
-		p.log.Debugf(msg)
+		p.logger.Debugf(msg)
 	} else {
 		msg += fmt.Sprintf("\n\t-")
-		p.log.Debugf(msg)
+		p.logger.Debugf(msg)
 	}
 }
 

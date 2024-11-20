@@ -50,6 +50,7 @@ github.com/noneymous/GoSslyze v0.0.0-20220927092045-0d914e44f3f0/go.mod h1:zItGS
 github.com/noneymous/go-redistributable-checker v0.0.0-20210325125326-f5f65eef4761/go.mod h1:Yr6DT8WUYuBekSltVo4LmXFNQ+gY52yHeZjJaoGKVmI=
 github.com/noneymous/go-sqlfmt v0.0.0-20241119083257-deebdf14ef56 h1:/k/aY4KmUS49Il6pR97kTFmuzeuhif3nOoUImQydpdA=
 github.com/noneymous/go-sqlfmt v0.0.0-20241119083257-deebdf14ef56/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
+github.com/noneymous/go-sqlfmt v0.0.0-20241120131548-ea78c840861c h1:aY68pYr9Jsk2ao6pTPcnVYgrGumfqmUR6vMtURgW+kk=
 github.com/noneymous/go-sqlfmt v0.0.0-20241120131548-ea78c840861c/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
 github.com/orcaman/concurrent-map/v2 v2.0.1/go.mod h1:9Eq3TG2oBe5FirmYWQfYO5iH1q0Jv47PLaNK++uCdOM=
