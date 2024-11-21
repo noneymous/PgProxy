@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -9,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/lithammer/shortuuid/v4"
@@ -22,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,7 +32,7 @@ import (
 	"time"
 )
 
-const intervalConnectionsLog = time.Second * 30
+const intervalConnectionsLog = time.Second * 60
 
 // ErrInternal defines an error message to be returned to the client if there was some internal error
 // Other errors, raised by the database, should be directly returned to the client.
@@ -48,6 +51,7 @@ func (e *ErrCertificate) Error() string {
 }
 
 type PgConn struct {
+	Uuid       string // random string identifying log messages of this connection stream
 	Pid        uint32
 	Sid        uint32
 	Database   string
@@ -69,7 +73,7 @@ type PgReverseProxy struct {
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
 	connectionMap cmap.ConcurrentMap[string, PgConn] // Map to lookup network connections by backend key data
-	connectionCtr uint                               // Counter for currently active proxy connections
+	connectionCnt uint                               // Counter for currently active proxy connections
 
 	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
@@ -195,8 +199,10 @@ func (p *PgReverseProxy) Stop() {
 
 	// Log shutdown
 	p.logger.Infof("PgProxy shutting down.")
-	if p.connectionCtr > 0 {
-		p.logger.Debugf("PgProxy has %d active connections left.", p.connectionCtr)
+	if p.connectionCnt > 0 {
+		p.logger.Debugf("PgProxy has %d active connections left.", p.connectionCnt)
+		p.connectionsLogTicker.Reset(intervalConnectionsLog)
+		p.logConnections()
 	}
 
 	// Cancel context
@@ -257,7 +263,7 @@ func (p *PgReverseProxy) Serve() { // Log termination
 		if errClient != nil {
 
 			// Stop serving if listener got closed
-			if errors.As(errClient, &net.ErrClosed) {
+			if errors.Is(errClient, net.ErrClosed) {
 				return
 			}
 
@@ -274,13 +280,13 @@ func (p *PgReverseProxy) Serve() { // Log termination
 		}
 
 		// Increase connection counter
-		p.connectionCtr += 1
+		p.connectionCnt += 1
 
 		// Handle client connection
 		go func() {
 
 			// Decrease counter afterward
-			defer func() { p.connectionCtr -= 1 }()
+			defer func() { p.connectionCnt -= 1 }()
 
 			// Handle connection
 			p.handleClient(client)
@@ -382,9 +388,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log and execute action
-		logger.Debugf("Returning fatal error to client.")
+		logger.Debugf("Forwarding error response to client.")
 		errSend := clientBackend.Send(errResp)
-		if errSend != nil {
+		if errors.Is(errSend, net.ErrClosed) {
+			// Connection already closed
+		} else if errSend != nil {
 			logger.Errorf("Could not return fatal error to client: %s.", errSend)
 		}
 	}
@@ -489,7 +497,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				} else if errRead != io.EOF {
 					// Ignore read error
 				} else {
-					logger.Errorf("Cancel request failed: %s.", errRead)
+					logger.Errorf("Cancel response failed: %s.", errRead)
 					return // Abort in case of communication error
 				}
 			}
@@ -528,7 +536,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			var errCertificate *ErrCertificate
 			clientTls := tls.Server(client, tlsClient)
 			errClientTls := clientTls.Handshake()
-			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, syscall.ECONNRESET) { // Connection closed by client
+			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, net.ErrClosed) ||
+				errors.Is(errClientTls, syscall.ECONNRESET) || errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
 				_ = clientTls.Close()
 				logger.Debugf("Client terminated connection.")
 				return
@@ -1012,13 +1021,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	logger.Infof("Caching connection details.")
 
 	// Cache key data and associated database connection if available
-	k := shortuuid.New()[0:10] // Chose random value if no key data is available
+	k := uuid // Chose random value if no key data is available
 	if keyData != nil {
 		k = generateKey(keyData)
 	}
 
 	// Store connection under key
 	p.connectionMap.Set(k, PgConn{
+		Uuid:       uuid,
 		Pid:        keyData.ProcessID, // Might be 0 if no key data is available
 		Sid:        keyData.SecretKey, // Might be 0 if no key data is available
 		Database:   startupRaw.Parameters["database"],
@@ -1032,8 +1042,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	defer func() {
 		logger.Debugf("Removing cached connection details.")
 		p.connectionMap.Remove(k)
-		p.connectionsLogTicker.Reset(intervalConnectionsLog)
-		p.logConnections()
 	}()
 
 	// Print current connections
@@ -1102,7 +1110,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Client terminated connection.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
-				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
+				} else if errors.Is(errR, net.ErrClosed) { // Connection closed by PgProxy
 					// Connection closed by PgProxy
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from client failed: %s.", errR)
@@ -1120,11 +1128,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Forwarding query data to database receiver routine
 			if p.fnMonitoring != nil {
-				logger.Debugf("Request  Type '%T'.", r)
 
 				// Prepare data
 				switch q := r.(type) {
 				case *pgproto3.Query:
+					logger.Debugf("Request  Type '%T', sending query data.", r)
 					query := strings.Trim(q.String, " ")
 					chQueryData <- &QueryData{
 						Raw:       query,               // Original query string. Might be single query or sequence of queries.
@@ -1132,7 +1140,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						Timestamp: time.Now(),
 					}
 				case *pgproto3.Parse:
-					logger.Debugf("Request  Type '%T', sending query data.", r)
+					logger.Debugf("Request  Type '%T', sending Parse query data.", r)
 					query := strings.Trim(q.Query, " ")
 					chQueryData <- &QueryData{
 						Raw:       query,               // Original query string. Might be single query or sequence of queries.
@@ -1143,7 +1151,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					synced = false
 				case *pgproto3.Bind: // New command with previous query
 					if synced { // Bind right after Parse would send the same queryData again and get the channel stuck. Sync needs to be observed first
-						logger.Debugf("Request  Type '%T', sending query data.", r)
+						logger.Debugf("Request  Type '%T', sending Bind query data.", r)
 						query, okQuery := queryCache[q.PreparedStatement]
 						if okQuery {
 							query = strings.Trim(query, " ")
@@ -1153,11 +1161,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 								Timestamp: time.Now(),
 							}
 						}
+					} else {
+						logger.Debugf("Request  Type '%T', no new query data", r)
 					}
 					synced = false
 				case *pgproto3.Sync:
+					logger.Debugf("Request  Type '%T'.", r)
 					synced = true
 				default:
+					logger.Debugf("Request  Type '%T'.", r)
 				}
 
 				// Log branch completion, to see whether something got stuck
@@ -1240,7 +1252,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Log error with respective criticality
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
 					logger.Infof("Database terminated connection: %s.", errR)
-				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
+				} else if errors.Is(errR, net.ErrClosed) { // Connection closed by PgProxy
 					// Connection closed by PgProxy
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from server failed: %s.", errR)
@@ -1275,13 +1287,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					var query string
 					if commands >= len(queryData.Queries) {
 
-						// Log secondary error
-						logger.Errorf(
-							"Received %d responses, while only %d were expected.",
-							commands+1,
-							len(queryData.Queries),
-						)
-
 						// Get query, prettify and unify for logging
 						_, query = prettify(logger, queryData.Raw)
 
@@ -1297,6 +1302,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						commandResp,
 						commandResp.Message,
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+					)
+					logger.Debugf(
+						"Response Type '%T' details: \n%s",
+						commandResp,
+						spew.Sdump(commandResp),
 					)
 
 				case *pgproto3.EmptyQueryResponse: // Empty query string
@@ -1479,29 +1489,48 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 func (p *PgReverseProxy) logConnections() {
 	msg := "Active database connections:"
 	if p.connectionMap.Count() > 0 {
+
+		// Get current map items as slice
+		items := make([]PgConn, 0, p.connectionMap.Count())
 		for _, v := range p.connectionMap.Items() {
+			items = append(items, v)
+		}
+
+		// Sort slice
+		slices.SortFunc(items, func(a, b PgConn) int {
+			if a.Database == b.Database {
+				return cmp.Compare(a.User, b.User)
+			}
+			return cmp.Compare(a.Database, b.Database)
+		})
+
+		// Build log message
+		for _, v := range items {
 			user := v.User
 			if len(user) > 15 {
 				user = user[:12] + "..."
 			}
 			client := v.Client
-			if len(client) > 35 {
-				client = client[:32] + "..."
+			if len(client) > 25 {
+				client = client[:22] + "..."
 			}
 			msg += fmt.Sprintf(
-				"\n    Pid%-5d, Sid%-10d | Started: %-19s | Origin: %-17s | Db: %-10s | User: %-15s | Client: '%-35s'",
+				"\n    [%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s",
+				v.Uuid,
 				v.Pid,
 				v.Sid,
 				v.Timestamp.Format("2006-01-02 15:04:05"),
-				v.Connection.RemoteAddr(),
 				v.Database,
-				v.User,
-				v.Client,
+				user,
+				client,
+				v.Connection.RemoteAddr(),
 			)
 		}
+
+		// Log message
 		p.logger.Debugf(msg)
 	} else {
-		msg += fmt.Sprintf("\n\t-")
+		msg += fmt.Sprintf(" %d", p.connectionCnt)
 		p.logger.Debugf(msg)
 	}
 }
@@ -1574,7 +1603,8 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 }
 
 // splitQueries checks whether a query consists out of multiple single queries to be executed by the database
-// and returns a slice of single queries.
+// and returns a slice of single queries. Empty queries are removed from the result set. If there is no useful
+// content the result will be an empty slice
 func splitQueries(sql string) []string {
 
 	// Split queries by unquoted semicolon

@@ -1,8 +1,9 @@
 module github.com/noneymous/PgProxy
 
-go 1.20
+go 1.21
 
 require (
+	github.com/davecgh/go-spew v1.1.1
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgproto3/v2 v2.3.3
 	github.com/lithammer/shortuuid/v4 v4.0.0

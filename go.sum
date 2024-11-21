@@ -29,6 +29,7 @@ github.com/jackc/pgconn v1.14.3/go.mod h1:RZbme4uasqzybK2RK5c65VsHxoyaml09lx3tXO
 github.com/jackc/pgio v1.0.0 h1:g12B9UwVnzGhueNavwioyEEpAmqMe1E/BN9ES+8ovkE=
 github.com/jackc/pgio v1.0.0/go.mod h1:oP+2QK2wFfUWgr+gxjoBH9KGBb31Eio69xUb0w5bYf8=
 github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65 h1:DadwsjnMwFjfWc9y5Wi/+Zz7xoE5ALHsRQlOctkOiHc=
+github.com/jackc/pgmock v0.0.0-20210724152146-4ad1a8207f65/go.mod h1:5R2h2EEX+qri8jOWMbJCtaPWkrrNc7OHwsp2TCqp7ak=
 github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
 github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
 github.com/jackc/pgproto3/v2 v2.3.3 h1:1HLSx5H+tXR9pW3in3zaztoEwQYRC9SQaYUHjTSUOag=
@@ -48,8 +49,6 @@ github.com/lithammer/shortuuid/v4 v4.0.0/go.mod h1:Zs8puNcrvf2rV9rTH51ZLLcj7ZXqQ
 github.com/mattn/go-adodb v0.0.2-0.20200211113401-5e535a33399b/go.mod h1:jNKoiJuisgGZ2f3w/AoKwygiIm/LLnsSGQRUtPfAFFY=
 github.com/noneymous/GoSslyze v0.0.0-20220927092045-0d914e44f3f0/go.mod h1:zItGSuaqIGgUpZU9waEJ56pe8WnV7MjYoHc6p/wM+rU=
 github.com/noneymous/go-redistributable-checker v0.0.0-20210325125326-f5f65eef4761/go.mod h1:Yr6DT8WUYuBekSltVo4LmXFNQ+gY52yHeZjJaoGKVmI=
-github.com/noneymous/go-sqlfmt v0.0.0-20241119083257-deebdf14ef56 h1:/k/aY4KmUS49Il6pR97kTFmuzeuhif3nOoUImQydpdA=
-github.com/noneymous/go-sqlfmt v0.0.0-20241119083257-deebdf14ef56/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
 github.com/noneymous/go-sqlfmt v0.0.0-20241120131548-ea78c840861c h1:aY68pYr9Jsk2ao6pTPcnVYgrGumfqmUR6vMtURgW+kk=
 github.com/noneymous/go-sqlfmt v0.0.0-20241120131548-ea78c840861c/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
