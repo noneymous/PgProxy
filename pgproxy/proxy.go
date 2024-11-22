@@ -1061,12 +1061,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg := new(sync.WaitGroup)
 
 	// Prepare buffered channel for communication between query and response
-	type QueryData struct {
-		Raw       string
-		Queries   []string
-		Timestamp time.Time
+	type Statement struct {
+		Query string
+		Start time.Time
 	}
-	chQueryData := make(chan *QueryData, 1)
+
+	// Prepare slice to recorde the sequence of queries sent to the database.
+	// This slice can be used to map later database responses to their original query request.
+	var statementSequence []*Statement
 
 	// Listen for client requests
 	go func() {
@@ -1090,13 +1092,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 		}()
 
-		// Prepare query cache for extended query flow / prepared statement,
-		// where previous queries might be referenced and reused
-		queryCache := make(map[string]string)
-
-		// Prepare synced flag indicating whether database response can be expected.
-		// Sending query data gain before database is ready to would get the query data channel stuck.
-		synced := false
+		// Prepare cache to lookup previously defined prepared statements (queries).
+		// In extended query flow the Bind message might reference previously defined queries.
+		var statementCache = make(map[string]string)
 
 		// Loop and listen for client requests
 		for {
@@ -1106,12 +1104,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errR != nil {
 
 				// Log error with respective criticality
+				var opError *net.OpError
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by client
 					logger.Debugf("Client terminated connection.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
 				} else if errors.Is(errR, net.ErrClosed) { // Connection closed by PgProxy
 					// Connection closed by PgProxy
+				} else if errors.As(errR, &opError) {
+					logger.Infof("Client connection terminated: %s", opError)
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from client failed: %s.", errR)
 				}
@@ -1132,42 +1133,46 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Prepare data
 				switch q := r.(type) {
 				case *pgproto3.Query:
-					logger.Debugf("Request  Type '%T', sending query data.", r)
-					query := strings.Trim(q.String, " ")
-					chQueryData <- &QueryData{
-						Raw:       query,               // Original query string. Might be single query or sequence of queries.
-						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-						Timestamp: time.Now(),
+
+					// Split multi-query into single SQL statements
+					queries := splitQueries(trimRecursive(q.String, " \n"))
+
+					// Log action
+					if len(queries) == 1 {
+						logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+					} else if len(queries) > 1 {
+						logger.Debugf("Request  Type '%T', adding %d queries to statement sequence.", r, len(queries))
 					}
+
+					// Add query to statement sequence
+					for _, query := range queries {
+						statementSequence = append(statementSequence, &Statement{
+							Query: query,
+							Start: time.Time{},
+						})
+					}
+
 				case *pgproto3.Parse:
-					logger.Debugf("Request  Type '%T', sending Parse query data.", r)
-					query := strings.Trim(q.Query, " ")
-					chQueryData <- &QueryData{
-						Raw:       query,               // Original query string. Might be single query or sequence of queries.
-						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-						Timestamp: time.Now(),
+					logger.Debugf("Request  Type '%T', registering query.", r)
+
+					// Add query to prepared statement cache
+					statementCache[q.Name] = trimRecursive(q.Query, " \n")
+
+				case *pgproto3.Bind: // Client requesting to execute a previously parsed/prepared statement
+					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+
+					// Retrieve associated query from statement cache
+					query, okQuery := statementCache[q.PreparedStatement]
+					if !okQuery {
+						logger.Errorf("Reference '%s' not existing in statement cache.", q.PreparedStatement)
 					}
-					queryCache[q.Name] = query
-					synced = false
-				case *pgproto3.Bind: // New command with previous query
-					if synced { // Bind right after Parse would send the same queryData again and get the channel stuck. Sync needs to be observed first
-						logger.Debugf("Request  Type '%T', sending Bind query data.", r)
-						query, okQuery := queryCache[q.PreparedStatement]
-						if okQuery {
-							query = strings.Trim(query, " ")
-							chQueryData <- &QueryData{
-								Raw:       query,               // Original query string. Might be single query or sequence of queries.
-								Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-								Timestamp: time.Now(),
-							}
-						}
-					} else {
-						logger.Debugf("Request  Type '%T', no new query data", r)
-					}
-					synced = false
-				case *pgproto3.Sync:
-					logger.Debugf("Request  Type '%T'.", r)
-					synced = true
+
+					// Add query to statement sequence
+					statementSequence = append(statementSequence, &Statement{
+						Query: query,
+						Start: time.Time{},
+					})
+
 				default:
 					logger.Debugf("Request  Type '%T'.", r)
 				}
@@ -1215,30 +1220,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		wg.Add(1)
 		defer wg.Done()
 
-		// Cache current query executed
-		var queryData = &QueryData{ // QueryData containing the query string currently worked on between the client and the database
-			Raw:       "",
-			Queries:   []string{},
-			Timestamp: time.Time{},
-		}
-		var queryTime = time.Time{} // Timestamp when the query finished executing (before transmission of results)
-		var commands = 0            // Amount of SQL commands processed by the backend (A query may contain multiple SQL commands)
-		var rows = 0                // Amount of rows returned by an SQL command
+		// Prepare process variables
+		var statement = 0               // Current SQL statement pointer in a sequence of statements
+		var statementRows = 0           // Amount of rows returned by an SQL statement
+		var statementDone = time.Time{} // Timestamp when the statement finished executing (before transmission)
 
 		// Catch potential panics to gracefully log issue with stacktrace
 		defer func() {
-
-			// Log issue
 			if r := recover(); r != nil {
-				if queryData != nil {
-					q := queryData.Raw
-					if commands < len(queryData.Queries) {
-						q = queryData.Queries[commands]
-					}
-					logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
-				} else {
-					logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
-				}
+				logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 			}
 		}()
 
@@ -1268,131 +1258,104 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				return
 			}
 
-			// Execute command monitoring if activated
+			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
 
-				// Get query data (FrontendMessage), as communication segment has started
-				if queryData.Raw == "" && len(queryData.Queries) == 0 { // Don't get next query until query data is reset by ReadyForQuery
-					select {
-					case queryData = <-chQueryData:
-					default: // Still working on the previous query
-					}
-				}
-
 				// Act on response depending on type
-				switch commandResp := r.(type) {
+				switch resp := r.(type) {
 				case *pgproto3.ErrorResponse:
 
-					// Check if amount of responses still matches expected amounts
-					var query string
-					if commands >= len(queryData.Queries) {
+					// Get associated query
+					query := statementSequence[statement].Query
 
-						// Get query, prettify and unify for logging
-						_, query = prettify(logger, queryData.Raw)
-
-					} else { // Process response if it is as expected
-
-						// Get query, prettify and unify for logging
-						_, query = prettify(logger, queryData.Queries[commands])
+					// Try to prettify query if possible {
+					if resp.Code != "42601" { // If no syntax error
+						_, query = prettify(logger, query)
 					}
 
 					// Log response type
 					logger.Infof(
-						"Response Type '%T': %s\n%s",
-						commandResp,
-						commandResp.Message,
+						"Response Type '%T': %s\n%s\n%s",
+						resp,
+						resp.Message,
+						spew.Sdump(resp),
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-					)
-					logger.Debugf(
-						"Response Type '%T' details: \n%s",
-						commandResp,
-						spew.Sdump(commandResp),
 					)
 
 				case *pgproto3.EmptyQueryResponse: // Empty query string
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
-					logger.Debugf("Response Type '%T'.", commandResp)
+					logger.Debugf("Response Type '%T'.", resp)
 
 				case *pgproto3.RowDescription:
 
-					// Postgres returns one RowDescription response per command result
-					logger.Debugf("Response Type '%T'.", commandResp)
-					queryTime = time.Now()
+					// Postgres returns one RowDescription response per statement result
+					logger.Debugf("Response Type '%T'.", resp)
+					statementDone = time.Now()
 
 				case *pgproto3.DataRow:
 
 					// Postgres returns one DataRow response per result ROW!
 					// Don't log, because it would bloat the log file.
-					rows++
+					statementRows++
 
 				case *pgproto3.CommandComplete:
 
 					// Make up for skipped DataRow response logs with aggregated DataRow log entry
-					if rows > 0 {
-						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, rows)
+					if statementRows > 0 {
+						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, statementRows)
 					}
 
-					// Check if amount of responses still matches expected amounts
-					if commands >= len(queryData.Queries) {
+					// Log action
+					logger.Infof("Response Type '%T', logging statement.", resp)
 
-						// Get query, prettify and unify for logging
-						_, query := prettify(logger, queryData.Raw)
+					// Get associated query data
+					queryData := statementSequence[statement]
 
-						// Log error
-						logger.Errorf(
-							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commands+1,
-							len(queryData.Queries),
-							query,
-						)
-					} else { // Process response if it is as expected
+					// Get query, prettify and unify for logging
+					tables, query := prettify(logger, queryData.Query)
 
-						// Log action
-						logger.Infof("Response Type '%T', logging command.", commandResp)
+					// Extract row count
+					queryRows := parseRows(logger, resp.CommandTag)
 
-						// Get query, prettify and unify for logging
-						tables, query := prettify(logger, queryData.Queries[commands])
-
-						// Extract row count
-						queryRows := parseRows(logger, commandResp.CommandTag)
-
-						// Log command execution
-						tEnd := time.Now()
-						tExec := tEnd
-						if !queryTime.IsZero() {
-							tExec = queryTime
-						}
-						errMonitoring := p.fnMonitoring(
-							logger,
-							startupRaw.Parameters["database"],
-							startupRaw.Parameters["user"],
-							tables,
-							query,
-							queryRows,
-							queryData.Timestamp,
-							tExec,
-							tEnd,
-							startupRaw.Parameters["application_name"],
-						)
-						if errMonitoring != nil {
-							logger.Errorf("Could not monitor query: %s.", errMonitoring)
-						}
+					// Log statement execution
+					tEnd := time.Now()
+					tExec := tEnd
+					if !statementDone.IsZero() {
+						tExec = statementDone
+					}
+					errMonitoring := p.fnMonitoring(
+						logger,
+						startupRaw.Parameters["database"],
+						startupRaw.Parameters["user"],
+						tables,
+						query,
+						queryRows,
+						queryData.Start,
+						tExec,
+						tEnd,
+						startupRaw.Parameters["application_name"],
+					)
+					if errMonitoring != nil {
+						logger.Errorf("Could not monitor query: %s.", errMonitoring)
 					}
 
-					// Reset command's response row counter
-					rows = 0
+					// Reset statement's response row counter
+					statementRows = 0
 
-					// Increment command counter
-					commands++
+					// Release memory of statement, it's not needed anymore
+					statementSequence[statement] = nil
+
+					// Increment statement counter
+					statement++
 
 					// Reset query time for new timing
-					queryTime = time.Time{}
+					statementDone = time.Time{}
 
 				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
 
 					// Update connection name in cached active connections
-					if commandResp.Name == "application_name" && commandResp.Value != "" {
+					if resp.Name == "application_name" && resp.Value != "" {
 
 						// Get previous data
 						pgConn, pgConnOk := p.connectionMap.Get(k)
@@ -1401,30 +1364,27 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						} else {
 
 							// Update application name
-							startupRaw.Parameters["application_name"] = commandResp.Value
-							pgConn.Client = commandResp.Value
+							startupRaw.Parameters["application_name"] = resp.Value
+							pgConn.Client = resp.Value
 
 							// Update cached information
 							p.connectionMap.Set(k, pgConn)
 						}
 					}
 
-					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
-					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", commandResp, commandResp.Name, commandResp.Value)
+					// Might be sent by the backend automatically AFTER CommandComplete
+					// (e.g. if notification of client after SET statement is intended)
+					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", resp, resp.Name, resp.Value)
 
 				case *pgproto3.ReadyForQuery:
+					logger.Debugf("Response Type '%T'.", resp)
 
-					// Reset query data (FrontendMessage), as communication segment has come to an end
-					logger.Debugf("Response Type '%T', resetting query data.", commandResp)
-					queryData = &QueryData{
-						Raw:       "",
-						Queries:   []string{},
-						Timestamp: time.Time{},
-					}
-					commands = 0
+					// Release memory and reset statement sequence
+					statementSequence = []*Statement{}
+					statement = 0
 
 				default:
-					logger.Debugf("Response Type '%T'.", commandResp)
+					logger.Debugf("Response Type '%T'.", resp)
 				}
 			}
 
@@ -1602,6 +1562,19 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	}
 }
 
+// trimRecursive trims a given character set from the beginning and end of a
+// string and repeats until no changes are detected anymore
+func trimRecursive(s string, cutset string) string {
+	lengthPrev := 0
+	for {
+		s = strings.Trim(s, cutset)
+		if len(s) == lengthPrev {
+			return s
+		}
+		lengthPrev = len(s)
+	}
+}
+
 // splitQueries checks whether a query consists out of multiple single queries to be executed by the database
 // and returns a slice of single queries. Empty queries are removed from the result set. If there is no useful
 // content the result will be an empty slice
@@ -1623,8 +1596,7 @@ func splitQueries(sql string) []string {
 	// Filter empty
 	queriesSanitized := make([]string, 0, len(queries))
 	for _, query := range queries {
-		query = strings.Trim(query, " ")
-		query = strings.Trim(query, "\n")
+		query = trimRecursive(query, " \n")
 		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
 			queriesSanitized = append(queriesSanitized, query)
 		}
@@ -1641,6 +1613,12 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	// Unify spacings in the query
 	query = strings.ReplaceAll(query, "    ", "  ") // Replace quad spaces with double spaces
 	query = strings.ReplaceAll(query, "\t", "  ")   // Replace tabulators with double spaces
+	query = trimRecursive(query, " \n")
+
+	// Return empty results if string is empty
+	if len(query) == 0 {
+		return
+	}
 
 	// Check if query contains some indentation already
 	indentation := -1
@@ -1751,11 +1729,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	sql = strings.ReplaceAll(sql, "\n\n", "\n") // Remove empty lines
 
 	// Remove empty spaces and linebreaks
-	for strings.HasPrefix(sql, "\n") || strings.HasSuffix(sql, "\n") ||
-		strings.HasPrefix(sql, " ") || strings.HasSuffix(sql, " ") {
-		sql = strings.Trim(sql, "\n") // Remove leading and trailing linebreaks
-		sql = strings.Trim(sql, " ")  // Remove leading and trailing spaces
-	}
+	sql = trimRecursive(sql, " \n") // Remove leading and trailing spaces and linebreaks
 
 	// Return with what was found as tables
 	// Empty if neither tokenizer nor manual search could match
