@@ -1340,14 +1340,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						logger.Errorf("Could not monitor query: %s.", errMonitoring)
 					}
 
-					// Reset statement's response row counter
-					statementRows = 0
-
 					// Release memory of statement, it's not needed anymore
+					// Do not reset whole statementSequence because subsequent queries might already be queued!
 					statementSequence[statement] = nil
 
-					// Increment statement counter
+					// Increment statement pointer
 					statement++
+
+					// Reset statement's response row counter
+					statementRows = 0
 
 					// Reset query time for new timing
 					statementDone = time.Time{}
@@ -1378,10 +1379,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				case *pgproto3.ReadyForQuery:
 					logger.Debugf("Response Type '%T'.", resp)
-
-					// Release memory and reset statement sequence
-					statementSequence = []*Statement{}
-					statement = 0
 
 				default:
 					logger.Debugf("Response Type '%T'.", resp)
