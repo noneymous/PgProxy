@@ -555,7 +555,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				return
 			} else if errClientTls != nil {
 				_ = clientTls.Close()
-				logger.Errorf("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
+				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
 				return // Abort in case of communication error
 			}
 
