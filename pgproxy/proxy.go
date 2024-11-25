@@ -1135,7 +1135,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.Query:
 
 					// Split multi-query into single SQL statements
-					queries := splitQueries(trimRecursive(q.String, " \n"))
+					queries := splitQueries(q.String)
 
 					// Log action
 					if len(queries) == 1 {
@@ -1156,7 +1156,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Request  Type '%T', registering query.", r)
 
 					// Add query to prepared statement cache
-					statementCache[q.Name] = trimRecursive(q.Query, " \n")
+					statementCache[q.Name] = trimEmptySyntax(q.Query)
 
 				case *pgproto3.Bind: // Client requesting to execute a previously parsed/prepared statement
 					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
@@ -1282,10 +1282,21 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 					)
 
+					// Skip subsequent already known queries, because they will be
+					// skipped by the database after this error
+					statement = len(statementSequence)
+
 				case *pgproto3.EmptyQueryResponse: // Empty query string
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
 					logger.Debugf("Response Type '%T'.", resp)
+
+					// Release memory of statement, it's not needed anymore
+					// Do not reset whole statementSequence because subsequent queries might already be queued!
+					statementSequence[statement] = nil
+
+					// Increment statement pointer
+					statement++
 
 				case *pgproto3.RowDescription:
 
@@ -1559,41 +1570,86 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	}
 }
 
-// trimRecursive trims a given character set from the beginning and end of a
-// string and repeats until no changes are detected anymore
-func trimRecursive(s string, cutset string) string {
-	lengthPrev := 0
-	for {
-		s = strings.Trim(s, cutset)
-		if len(s) == lengthPrev {
-			return s
-		}
-		lengthPrev = len(s)
-	}
-}
-
-// splitQueries checks whether a query consists out of multiple single queries to be executed by the database
-// and returns a slice of single queries. Empty queries are removed from the result set. If there is no useful
-// content the result will be an empty slice
+// splitQueries checks whether a query consists out of multiple single queries, indicated by a semicolon,
+// to be executed by the database. Returns a slice of queries. Queries are sanitized by empty leading or trailing
+// symbols. Empty queries are removed. If there is no useful query content at all, an empty slice is returned
 func splitQueries(sql string) []string {
 
-	// Split queries by unquoted semicolon
+	// Cleanup empty characters from both ends
+	sql = trimEmptySyntax(sql)
+
+	// Define parse states
+	const ( // iota is reset to 0
+		CommentNone             = 0
+		CommentMaybe            = iota
+		CommentLine             = iota
+		CommentMultiline        = iota
+		CommentMultilineClosing = iota
+	)
+
+	// Prepare memory for field func states
+	commentState := CommentNone
 	quotedSingle := false
 	quotedDouble := false
+
+	// Split queries by semicolon if it does not occure within single quotes, double quotes or any kind of comment
 	queries := strings.FieldsFunc(sql, func(r rune) bool {
-		if r == '"' && !quotedSingle {
-			quotedDouble = !quotedDouble
+
+		// Manage opening/closing of line comment
+		if commentState == CommentNone {
+			if r == '/' || r == '-' {
+				commentState = CommentMaybe
+			}
+		} else if commentState == CommentMaybe {
+			if r == '/' || r == '-' {
+				commentState = CommentLine
+			} else if r == '*' {
+				commentState = CommentMultiline
+			} else if r != '/' {
+				commentState = CommentNone
+			}
+		} else if commentState == CommentLine {
+			if r == '\n' {
+				commentState = CommentNone
+			}
+		} else if commentState == CommentMultiline {
+			if r == '*' {
+				commentState = CommentMultilineClosing
+			}
+		} else if commentState == CommentMultilineClosing {
+			if r == '/' {
+				commentState = CommentNone
+			} else if r != '*' {
+				commentState = CommentMultiline // Fall back, multi line comment is not yet closing
+			}
 		}
-		if r == '\'' && !quotedDouble {
-			quotedSingle = !quotedSingle
+
+		// If not commented, check if quoted string starts
+		if commentState <= CommentMaybe {
+
+			// Manage opening/closing of double quote strings
+			if r == '"' && !quotedSingle {
+				quotedDouble = !quotedDouble
+			}
+
+			// Manage opening/closing of single quote strings
+			if r == '\'' && !quotedDouble {
+				quotedSingle = !quotedSingle
+			}
 		}
-		return !quotedSingle && !quotedDouble && r == ';'
+
+		// Return true if character unquoted and uncommented semicolon
+		return r == ';' &&
+			!quotedSingle &&
+			!quotedDouble &&
+			commentState != CommentLine &&
+			commentState != CommentMultiline
 	})
 
-	// Filter empty
+	// Sanitize split queries and remove empty ones
 	queriesSanitized := make([]string, 0, len(queries))
 	for _, query := range queries {
-		query = trimRecursive(query, " \n")
+		query = trimEmptySyntax(query)
 		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
 			queriesSanitized = append(queriesSanitized, query)
 		}
@@ -1603,6 +1659,19 @@ func splitQueries(sql string) []string {
 	return queriesSanitized
 }
 
+// trimEmptySyntax trims a given character set from the beginning and end of a
+// string and repeats until no changes are detected anymore
+func trimEmptySyntax(s string) string {
+	lengthPrev := 0
+	for {
+		s = strings.Trim(s, " \n\t") // Remove all leading and trailing characters that do not have a meaning
+		if len(s) == lengthPrev {
+			return s
+		}
+		lengthPrev = len(s)
+	}
+}
+
 // prettify returns a formatted SQL query string and a list of database tables it is targeting. An SQL query
 // does not necessarily need to target a table. Also, it might target multiple ones via subqueries.
 func prettify(logger scanUtils.Logger, query string) (tables []string, sql string) {
@@ -1610,7 +1679,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	// Unify spacings in the query
 	query = strings.ReplaceAll(query, "    ", "  ") // Replace quad spaces with double spaces
 	query = strings.ReplaceAll(query, "\t", "  ")   // Replace tabulators with double spaces
-	query = trimRecursive(query, " \n")
+	query = trimEmptySyntax(query)
 
 	// Return empty results if string is empty
 	if len(query) == 0 {
@@ -1726,7 +1795,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	sql = strings.ReplaceAll(sql, "\n\n", "\n") // Remove empty lines
 
 	// Remove empty spaces and linebreaks
-	sql = trimRecursive(sql, " \n") // Remove leading and trailing spaces and linebreaks
+	sql = trimEmptySyntax(sql) // Remove leading and trailing spaces and linebreaks
 
 	// Return with what was found as tables
 	// Empty if neither tokenizer nor manual search could match
