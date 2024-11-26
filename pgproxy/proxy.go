@@ -276,12 +276,6 @@ func (p *PgReverseProxy) Serve() { // Log termination
 			continue // Continue with next connection attempt
 		}
 
-		// Disable client timeout
-		errDeadline := client.SetDeadline(time.Time{})
-		if errDeadline != nil {
-			p.logger.Errorf("Could not set client deadline: %s.", errDeadline)
-		}
-
 		// Increase connection counter
 		p.connectionCnt += 1
 
@@ -323,10 +317,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 	}()
 
-	// Set deadline initial deadline for client to complete handshake
+	// Set initial deadline for client to complete handshake
 	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
 	if errDeadline != nil {
-		logger.Errorf("Setting client deadline failed: %s.", errDeadline)
+		logger.Errorf("Could not set client deadline: %s.", errDeadline)
 	}
 
 	// Log initial message
@@ -1073,6 +1067,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// This slice can be used to map later database responses to their original query request.
 	var statementSequence []*Statement
 
+	// Disable client timeout, client might hold connection ready.
+	errDeadline = client.SetDeadline(time.Time{})
+	if errDeadline != nil {
+		p.logger.Errorf("Could not reset client deadline: %s.", errDeadline)
+	}
+
 	// Listen for client requests
 	go func() {
 
@@ -1102,7 +1102,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Loop and listen for client requests
 		for {
 
-			// Receive from client, don't timeout, client might hold connection ready.
+			// Receive from client
 			r, errR := clientBackend.Receive()
 			if errR != nil {
 
