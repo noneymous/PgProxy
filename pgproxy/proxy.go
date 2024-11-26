@@ -276,6 +276,12 @@ func (p *PgReverseProxy) Serve() { // Log termination
 			continue // Continue with next connection attempt
 		}
 
+		// Disable client timeout
+		errDeadline := client.SetDeadline(time.Time{})
+		if errDeadline != nil {
+			p.logger.Errorf("Could not set client deadline: %s.", errDeadline)
+		}
+
 		// Increase connection counter
 		p.connectionCnt += 1
 
