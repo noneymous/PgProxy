@@ -1232,6 +1232,28 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 		}()
 
+		// Check if there were remaining queries at the end and warn about for debugging purposes
+		defer func() {
+			if statement < len(statementSequence) {
+
+				// Extract queries from remaining statements
+				remainingQueries := make([]string, 0, len(statementSequence)-statement)
+				for _, remainingQuery := range statementSequence[statement:] {
+					remainingQueries = append(remainingQueries, remainingQuery.Query)
+				}
+
+				// Log remaining statements
+				// There should be zero left, amount of requests should exactly match amount of responses,
+				// otherwise, the monitoring function might point to wrong statement queries causing invalid logs!
+				logger.Errorf(
+					"Responses did not match requests and are off by %d (%d total):\n%s",
+					len(statementSequence)-statement,
+					len(statementSequence),
+					strings.Join(remainingQueries, ";\n"),
+				)
+			}
+		}()
+
 		// Loop and listen for database responses
 		for {
 
