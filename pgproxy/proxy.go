@@ -69,7 +69,6 @@ type PgReverseProxy struct {
 	listenerPort       uint             // PgProxy port to listen on
 	listenerForceSsl   bool             // PgProxy flag whether to force SSL or allow plaintext connections
 	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
-	listenerTimeout    time.Duration    // Inactivity timeout for connected clients
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
 	connectionMap cmap.ConcurrentMap[string, PgConn] // Map to lookup network connections by backend key data
@@ -101,7 +100,6 @@ func Init(
 	listenerPort uint,
 	listenerForceSsl bool, // Whether to reject plain text connections
 	listenerDefaultSni bool, // Whether to reject SSL connections without SNI. Without SNI the first SNI configuration would be applied as the default.
-	listenerTimeout time.Duration,
 ) (*PgReverseProxy, error) {
 
 	// Open listener
@@ -120,7 +118,6 @@ func Init(
 		listenerPort:         listenerPort,
 		listenerForceSsl:     listenerForceSsl,
 		listenerDefaultSni:   listenerDefaultSni,
-		listenerTimeout:      listenerTimeout,
 		listenerConfigs:      make(map[string]Sni),
 		ctx:                  ctx,
 		ctxCancelFunc:        ctxCancel,
@@ -1099,7 +1096,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Loop and listen for client requests
 		for {
 
-			// Receive from client
+			// Receive from client, don't timeout, client might hold connection ready.
 			r, errR := clientBackend.Receive()
 			if errR != nil {
 
@@ -1119,12 +1116,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Return and end client receiver
 				return
-			}
-
-			// Update deadline for client to show activity
-			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
-			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s.", errDeadlineUpdate)
 			}
 
 			// Forwarding query data to database receiver routine
@@ -1431,12 +1422,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Return and end database receiver
 				return
-			}
-
-			// Update deadline for client to show activity
-			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
-			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s.", errDeadlineUpdate)
 			}
 
 			// Exit goroutine if necessary

@@ -40,18 +40,12 @@ func main() {
 		}
 	}()
 
-	// Define client timeout duration
-	clientTimeout := time.Second * 60 * 10
-
 	// Initialize PgProxy
-	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, false, true, clientTimeout)
+	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, false, true)
 	if errPgProxy != nil {
 		logger.Errorf("Could not initialize PgProxy: %s.", errPgProxy)
 		return
 	}
-
-	// Log client timeout
-	logger.Infof("Client timeout set to %s.", clientTimeout.String())
 
 	// Register monitoring function (optional)
 	pgProxy.RegisterMonitoring(func(
