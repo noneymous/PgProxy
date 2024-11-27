@@ -51,14 +51,15 @@ func (e *ErrCertificate) Error() string {
 }
 
 type PgConn struct {
-	Uuid       string // random string identifying log messages of this connection stream
-	Pid        uint32
-	Sid        uint32
-	Database   string
-	User       string
-	Client     string
-	Connection net.Conn
-	Timestamp  time.Time
+	Uuid            string // random string identifying log messages of this connection stream
+	Pid             uint32
+	Sid             uint32
+	Database        string
+	User            string
+	Client          string
+	Connection      net.Conn
+	Timestamp       time.Time
+	QueryInProgress bool
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
@@ -71,8 +72,8 @@ type PgReverseProxy struct {
 	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
-	connectionMap cmap.ConcurrentMap[string, PgConn] // Map to lookup network connections by backend key data
-	connectionCnt uint                               // Counter for currently active proxy connections
+	connectionMap cmap.ConcurrentMap[string, *PgConn] // Map to lookup network connections by backend key data
+	connectionCnt uint                                // Counter for currently active proxy connections
 
 	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
@@ -122,7 +123,7 @@ func Init(
 		ctx:                  ctx,
 		ctxCancelFunc:        ctxCancel,
 		connectionsLogTicker: time.NewTicker(intervalConnectionsLog),
-		connectionMap:        cmap.New[PgConn](),
+		connectionMap:        cmap.New[*PgConn](),
 	}
 
 	// Launch background routine regularly printing currently active connections
@@ -1023,8 +1024,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		k = generateKey(keyData)
 	}
 
-	// Store connection under key
-	p.connectionMap.Set(k, PgConn{
+	// Prepare PgCon data for this connection
+	pgConn := PgConn{
 		Uuid:       uuid,
 		Pid:        keyData.ProcessID, // Might be 0 if no key data is available
 		Sid:        keyData.SecretKey, // Might be 0 if no key data is available
@@ -1033,7 +1034,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		Client:     startupRaw.Parameters["application_name"],
 		Connection: connDatabase,
 		Timestamp:  time.Now(),
-	})
+	}
+
+	// Store connection under key
+	p.connectionMap.Set(k, &pgConn)
 
 	// Make sure entry is cleaned from map after database connection is terminated
 	defer func() {
@@ -1145,8 +1149,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					for _, query := range queries {
 						statementSequence = append(statementSequence, &Statement{
 							Query: query,
-							Start: time.Time{},
+							Start: time.Now(),
 						})
+					}
+
+					// Switch connection state to active
+					if len(queries) > 0 {
+						pgConn.QueryInProgress = true
 					}
 
 				case *pgproto3.Parse:
@@ -1167,8 +1176,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Add query to statement sequence
 					statementSequence = append(statementSequence, &Statement{
 						Query: query,
-						Start: time.Time{},
+						Start: time.Now(),
 					})
+
+					// Switch connection state to active
+					pgConn.QueryInProgress = true
 
 				default:
 					logger.Debugf("Request  Type '%T'.", r)
@@ -1285,7 +1297,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.ErrorResponse:
 
 					// Get associated query
-					query := statementSequence[statement].Query
+					query := ""
+					if statement > len(statementSequence) {
+						query = statementSequence[statement].Query
+					} else {
+						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
+					}
 
 					// Try to prettify query if possible {
 					if resp.Code != "42601" { // If no syntax error
@@ -1385,30 +1402,27 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
 
-					// Update connection name in cached active connections
-					if resp.Name == "application_name" && resp.Value != "" {
-
-						// Get previous data
-						pgConn, pgConnOk := p.connectionMap.Get(k)
-						if !pgConnOk {
-							logger.Errorf("Could not get connection data '%s'", k)
-						} else {
-
-							// Update application name
-							startupRaw.Parameters["application_name"] = resp.Value
-							pgConn.Client = resp.Value
-
-							// Update cached information
-							p.connectionMap.Set(k, pgConn)
-						}
-					}
-
 					// Might be sent by the backend automatically AFTER CommandComplete
 					// (e.g. if notification of client after SET statement is intended)
 					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", resp, resp.Name, resp.Value)
 
+					// Update application name in startup data and active connections
+					if resp.Name == "application_name" && resp.Value != "" {
+
+						// Update application name in startup parameters
+						startupRaw.Parameters["application_name"] = resp.Value
+
+						// Switch connection state to passive
+						pgConn.Client = resp.Value
+					}
+
 				case *pgproto3.ReadyForQuery:
+
+					// Log action
 					logger.Debugf("Response Type '%T'.", resp)
+
+					// Switch connection state to passive
+					pgConn.QueryInProgress = false
 
 				default:
 					logger.Debugf("Response Type '%T'.", resp)
@@ -1472,13 +1486,13 @@ func (p *PgReverseProxy) logConnections() {
 	if p.connectionMap.Count() > 0 {
 
 		// Get current map items as slice
-		items := make([]PgConn, 0, p.connectionMap.Count())
+		items := make([]*PgConn, 0, p.connectionMap.Count())
 		for _, v := range p.connectionMap.Items() {
 			items = append(items, v)
 		}
 
 		// Sort slice
-		slices.SortFunc(items, func(a, b PgConn) int {
+		slices.SortFunc(items, func(a, b *PgConn) int {
 			if a.Database == b.Database {
 				return cmp.Compare(a.User, b.User)
 			}
@@ -1495,8 +1509,12 @@ func (p *PgReverseProxy) logConnections() {
 			if len(client) > 25 {
 				client = client[:22] + "..."
 			}
+			state := "P"
+			if v.QueryInProgress {
+				state = "A"
+			}
 			msg += fmt.Sprintf(
-				"\n    [%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s",
+				"\n    [%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s | State: %s",
 				v.Uuid,
 				v.Pid,
 				v.Sid,
@@ -1505,6 +1523,7 @@ func (p *PgReverseProxy) logConnections() {
 				user,
 				client,
 				v.Connection.RemoteAddr(),
+				state,
 			)
 		}
 
