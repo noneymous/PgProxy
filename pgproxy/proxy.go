@@ -1298,7 +1298,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Get associated query
 					query := ""
-					if statement > len(statementSequence) {
+					if statement < len(statementSequence) {
 						query = statementSequence[statement].Query
 					} else {
 						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
@@ -1514,7 +1514,8 @@ func (p *PgReverseProxy) logConnections() {
 				state = "A"
 			}
 			msg += fmt.Sprintf(
-				"\n    [%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s | State: %s",
+				"\n    %s[%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s",
+				state,
 				v.Uuid,
 				v.Pid,
 				v.Sid,
@@ -1523,7 +1524,6 @@ func (p *PgReverseProxy) logConnections() {
 				user,
 				client,
 				v.Connection.RemoteAddr(),
-				state,
 			)
 		}
 
