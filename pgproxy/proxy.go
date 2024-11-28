@@ -352,12 +352,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				}
 			}
 
-			// Check if origin IP is allowed
-			if len(listenerConfig.AllowedOrigins) > 0 &&
-				!scanUtils.StrContained(t.Conn.RemoteAddr().String(), listenerConfig.AllowedOrigins) {
-				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid origin")}
-			}
-
 			// Return related certificate
 			return &listenerConfig.Certificate, nil
 		},
