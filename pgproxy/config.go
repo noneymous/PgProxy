@@ -5,7 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"gorm.io/gorm/utils"
+	scanUtils "github.com/siemens/GoScans/utils"
 	"os"
 	"strings"
 )
@@ -14,9 +14,10 @@ import (
 var SslModes = []string{"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 
 type Sni struct {
-	CertPath string   `json:"cert_path"` // SSL certificate presented to the database client
-	KeyPath  string   `json:"key_path"`  // SSL certificate presented to the database client
-	Database Database `json:"database"`  // Target database to redirect clients to
+	CertPath       string   `json:"cert_path"`       // SSL certificate presented to the database client
+	KeyPath        string   `json:"key_path"`        // SSL certificate presented to the database client
+	Database       Database `json:"database"`        // Target database to redirect clients to
+	AllowedOrigins []string `json:"allowed_origins"` // Whitelist of IPs allowed to access this SNI
 
 	Certificate     tls.Certificate  `json:"-"` // To  be loaded from cert and key path and not Json serializable
 	CertificateX509 x509.Certificate `json:"-"` // To  be loaded from cert and key path and not Json serializable
@@ -90,7 +91,7 @@ func (t *Database) UnmarshalJSON(b []byte) error {
 	if len(raw.Host) <= 4 {
 		return fmt.Errorf("invalid host")
 	}
-	if !utils.Contains(SslModes, raw.SslMode) {
+	if !scanUtils.StrContained(raw.SslMode, SslModes) {
 		return fmt.Errorf("valid ssl modes are: %s", strings.Join(SslModes, ", "))
 	}
 

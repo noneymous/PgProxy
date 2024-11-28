@@ -20,7 +20,6 @@ import (
 	"github.com/noneymous/go-sqlfmt/sqlfmt/parser"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	scanUtils "github.com/siemens/GoScans/utils"
-	"gorm.io/gorm/utils"
 	"io"
 	"net"
 	"os"
@@ -58,7 +57,8 @@ type PgConn struct {
 	User            string
 	Client          string
 	Connection      net.Conn
-	Timestamp       time.Time
+	TimestampStart  time.Time
+	TimestampLast   time.Time
 	QueryInProgress bool
 }
 
@@ -342,10 +342,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
 			if !okListenerConfig {
 				if t.ServerName == "" {
-					return nil, &ErrCertificate{Message: fmt.Sprintf("no default certificate for empty SNI")}
+					return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
 				} else {
-					return nil, &ErrCertificate{Message: fmt.Sprintf("no certificate for SNI '%s'", t.ServerName)}
+					return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
 				}
+			}
+
+			// Check if origin IP is allowed
+			if len(listenerConfig.AllowedOrigins) > 0 &&
+				!scanUtils.StrContained(t.Conn.RemoteAddr().String(), listenerConfig.AllowedOrigins) {
+				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid origin")}
 			}
 
 			// Return related certificate
@@ -544,10 +550,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Prepare error to return to the client
 				clientErrMsg = &pgconn.PgError{
 					Code:    "FATAL",
-					Message: "SSL connection with valid SNI required",
+					Message: "SSL connection with " + errCertificate.Error(),
 				}
 
-				// Log issue andn return
+				// Log issue and return
 				_ = clientTls.Close()
 				logger.Infof("Client startup failed during SSL handshake: %s.", errClientTls)
 				return
@@ -653,6 +659,21 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		return // Abort in case of communication error
 	}
 
+	// Check if origin IP is allowed
+	if len(listenerConfig.AllowedOrigins) > 0 &&
+		!scanUtils.StrContained(client.RemoteAddr().String(), listenerConfig.AllowedOrigins) {
+
+		// Set error details to be forwarded to client
+		clientErrMsg = &pgconn.PgError{
+			Code:    "FATAL",
+			Message: "Connection with invalid origin",
+		}
+
+		// Log error and return
+		logger.Errorf("Client startup failed: Invalid client origin for SNI.")
+		return // Abort in case of communication error
+	}
+
 	// Log database selection
 	logger.Debugf("Proxying to database server '%s'.", listenerConfig.Database.Host)
 
@@ -688,7 +709,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Decide whether to verify the encrypted connection
 		skipVerify := false
-		if utils.Contains([]string{"allow", "prefer", "require"}, listenerConfig.Database.SslMode) {
+		if scanUtils.StrContained(listenerConfig.Database.SslMode, []string{"allow", "prefer", "require"}) {
 			skipVerify = true
 		}
 
@@ -1016,6 +1037,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	///////////////////////////////////////////////////////////////////////
 	// Cache connections for later lookups, e.g. to execute cancel requests
 	///////////////////////////////////////////////////////////////////////
+	logger.Debugf("Connection PID: %d.", keyData.ProcessID)
+	logger.Debugf("Connection SID: %d.", keyData.SecretKey)
 	logger.Infof("Caching connection details.")
 
 	// Cache key data and associated database connection if available
@@ -1026,14 +1049,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Prepare PgCon data for this connection
 	pgConn := PgConn{
-		Uuid:       uuid,
-		Pid:        keyData.ProcessID, // Might be 0 if no key data is available
-		Sid:        keyData.SecretKey, // Might be 0 if no key data is available
-		Database:   startupRaw.Parameters["database"],
-		User:       startupRaw.Parameters["user"],
-		Client:     startupRaw.Parameters["application_name"],
-		Connection: connDatabase,
-		Timestamp:  time.Now(),
+		Uuid:           uuid,
+		Pid:            keyData.ProcessID, // Might be 0 if no key data is available
+		Sid:            keyData.SecretKey, // Might be 0 if no key data is available
+		Database:       startupRaw.Parameters["database"],
+		User:           startupRaw.Parameters["user"],
+		Client:         startupRaw.Parameters["application_name"],
+		Connection:     connDatabase,
+		TimestampStart: time.Now(),
 	}
 
 	// Store connection under key
@@ -1063,8 +1086,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Prepare buffered channel for communication between query and response
 	type Statement struct {
-		Query string
-		Start time.Time
+		Query      string
+		QueryInput string // Original query sent by client, which Query is extracted from
+		Start      time.Time
 	}
 
 	// Prepare slice to recorde the sequence of queries sent to the database.
@@ -1148,13 +1172,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Add query to statement sequence
 					for _, query := range queries {
 						statementSequence = append(statementSequence, &Statement{
-							Query: query,
-							Start: time.Now(),
+							Query:      query,
+							QueryInput: q.String,
+							Start:      time.Now(),
 						})
 					}
 
 					// Switch connection state to active
 					if len(queries) > 0 {
+						pgConn.TimestampLast = time.Now()
 						pgConn.QueryInProgress = true
 					}
 
@@ -1175,11 +1201,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Add query to statement sequence
 					statementSequence = append(statementSequence, &Statement{
-						Query: query,
-						Start: time.Now(),
+						Query:      query,
+						QueryInput: query,
+						Start:      time.Now(),
 					})
 
 					// Switch connection state to active
+					pgConn.TimestampLast = time.Now()
 					pgConn.QueryInProgress = true
 
 				default:
@@ -1298,19 +1326,28 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Get associated query
 					query := ""
+					queryInput := ""
 					if statement < len(statementSequence) {
 						query = statementSequence[statement].Query
+						queryInput = statementSequence[statement].QueryInput
 					} else {
 						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
 					}
 
 					// Try to prettify query if possible {
-					if resp.Code != "42601" { // If no syntax error
-						_, query = prettify(logger, query)
+					if resp.Code == "42601" { // Syntax error
+						// Fall back to the complete query input from the client
+						// The database is parsing the whole multi-query SQL string and checking its syntax
+						// before executing each of the contained queries. In case of a syntax error the
+						// database only returns once and the syntax error might not necessarily need to
+						// be contained in the first of the many queries.
+						query = queryInput
+					} else { // No syntax error
+						_, query = prettify(logger, query) // Try to prettify
 					}
 
 					// Log response type
-					logger.Infof(
+					logger.Debugf(
 						"Response Type '%T': %s\n%s\n%s",
 						resp,
 						resp.Message,
@@ -1322,7 +1359,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// skipped by the database after this error
 					statement = len(statementSequence)
 
-				case *pgproto3.EmptyQueryResponse: // Empty query string
+				case *pgproto3.EmptyQueryResponse, *pgproto3.PortalSuspended: // Responses from empty query strings
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
 					logger.Debugf("Response Type '%T'.", resp)
@@ -1333,6 +1370,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Increment statement pointer
 					statement++
+
+					// Reset statement's response row counter
+					statementRows = 0
+
+					// Reset query time for new timing
+					statementDone = time.Time{}
 
 				case *pgproto3.RowDescription:
 
@@ -1502,24 +1545,26 @@ func (p *PgReverseProxy) logConnections() {
 		// Build log message
 		for _, v := range items {
 			user := v.User
-			if len(user) > 15 {
-				user = user[:12] + "..."
+			if len(user) > 20 {
+				user = user[:17] + "..."
 			}
 			client := v.Client
 			if len(client) > 25 {
 				client = client[:22] + "..."
 			}
-			state := "P"
+			last := v.TimestampStart
+			if !v.TimestampLast.IsZero() {
+				last = v.TimestampLast
+			}
+			state := "Pssv"
 			if v.QueryInProgress {
-				state = "A"
+				state = "Actv"
 			}
 			msg += fmt.Sprintf(
-				"\n    %s[%s] | P-%-5d | S-%-10d | Start: %-19s | Db: %-10s | Usr: %-15s | Client: '%-25s' | Src: %-15s",
-				state,
+				"\n    [%s] | Last: %-19s (%s) | Db: %-10s | Usr: %-20s | Client: '%-25s' | Src: %-15s",
 				v.Uuid,
-				v.Pid,
-				v.Sid,
-				v.Timestamp.Format("2006-01-02 15:04:05"),
+				last.Format("2006-01-02 15:04:05"),
+				state,
 				v.Database,
 				user,
 				client,
@@ -1868,7 +1913,7 @@ func findTableNames(tokens []lexer.Token) []string {
 		if token.Type == lexer.FROM { // Mark found to indicate next value is table name
 			found = true
 		} else if found && token.Type == lexer.IDENT {
-			if !utils.Contains(tables, token.Value) {
+			if !scanUtils.StrContained(token.Value, tables) {
 				tables = append(tables, token.Value)
 			}
 			found = false // Reset after associated IDENT was found

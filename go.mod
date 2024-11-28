@@ -12,7 +12,6 @@ require (
 	github.com/siemens/GoScans v1.0.2
 	golang.org/x/crypto v0.28.0
 	golang.org/x/text v0.19.0
-	gorm.io/gorm v1.25.12
 )
 
 require (

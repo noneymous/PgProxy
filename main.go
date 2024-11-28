@@ -20,6 +20,7 @@ var snis = []pgproxy.Sni{
 			Port:    5432,                  // The database port  to proxy the client to
 			SslMode: "prefer",              // one out of pgproxy.SslModes
 		},
+		AllowedOrigins: nil, // Option to restrict access to SNI for a list of origin IPs
 	},
 }
 
