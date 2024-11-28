@@ -657,9 +657,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		return // Abort in case of communication error
 	}
 
+	// Extract IP from remote address
+	host, _, errHost := net.SplitHostPort(client.RemoteAddr().String())
+	if errHost != nil {
+		logger.Errorf("Client startup failed: could not parse remote address '%s'.", client.RemoteAddr().String())
+		return
+	}
+
 	// Check if origin IP is allowed
 	if len(listenerConfig.AllowedOrigins) > 0 &&
-		!scanUtils.StrContained(client.RemoteAddr().String(), listenerConfig.AllowedOrigins) {
+		!scanUtils.StrContained(host, listenerConfig.AllowedOrigins) {
 
 		// Set error details to be forwarded to client
 		clientErrMsg = &pgconn.PgError{
@@ -668,7 +675,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log error and return
-		logger.Errorf("Client startup failed: Invalid client origin for SNI.")
+		logger.Errorf("Client startup failed: Invalid origin '%s' for SNI.", host)
 		return // Abort in case of communication error
 	}
 
