@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"github.com/noneymous/PgProxy/pgproxy"
@@ -41,8 +42,15 @@ func main() {
 		}
 	}()
 
+	// Prepare some reasonable TLS config
+	tlsConf := &tls.Config{
+		MinVersion:       tls.VersionTLS12,
+		MaxVersion:       tls.VersionTLS13,
+		CurvePreferences: []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+	}
+
 	// Initialize PgProxy
-	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, false, true)
+	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, tlsConf, false, true)
 	if errPgProxy != nil {
 		logger.Errorf("Could not initialize PgProxy: %s.", errPgProxy)
 		return

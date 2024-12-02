@@ -69,7 +69,8 @@ type PgReverseProxy struct {
 	logger             scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
 	listener           net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
 	listenerPort       uint             // PgProxy port to listen on
-	listenerForceSsl   bool             // PgProxy flag whether to force SSL or allow plaintext connections
+	listenerTlsConf    *tls.Config      // TLS configuration to use to service clients
+	listenerForceTls   bool             // PgProxy flag whether to force SSL or allow plaintext connections
 	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
@@ -100,7 +101,8 @@ type PgReverseProxy struct {
 func Init(
 	logger scanUtils.Logger,
 	listenerPort uint,
-	listenerForceSsl bool, // Whether to reject plain text connections
+	listenerTlsConf *tls.Config,
+	listenerForceTls bool, // Whether to reject plain text connections
 	listenerDefaultSni bool, // Whether to reject SSL connections without SNI. Without SNI the first SNI configuration would be applied as the default.
 ) (*PgReverseProxy, error) {
 
@@ -118,7 +120,8 @@ func Init(
 		logger:               logger,
 		listener:             listener,
 		listenerPort:         listenerPort,
-		listenerForceSsl:     listenerForceSsl,
+		listenerTlsConf:      listenerTlsConf,
+		listenerForceTls:     listenerForceTls,
 		listenerDefaultSni:   listenerDefaultSni,
 		listenerConfigs:      make(map[string]Sni),
 		ctx:                  ctx,
@@ -334,29 +337,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Prepare memory to remember SNI sent by client
 	sni := ""
 
-	// Prepare TLS configuration for client connections. TLS config contains a custom function
-	// to select an applicable certificate based on the SNI indicated by the client hello.
-	tlsClient := &tls.Config{
-		GetCertificate: func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
-			// Store SNI sent by client
-			sni = t.ServerName
-
-			// Get listener config based on SNI
-			listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
-			if !okListenerConfig {
-				if t.ServerName == "" {
-					return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
-				} else {
-					return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
-				}
-			}
-
-			// Return related certificate
-			return &listenerConfig.Certificate, nil
-		},
-	}
-
 	// Prepare client backend to receive client messages
 	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(client), client)
 
@@ -437,7 +417,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.StartupMessage:
 
 			// Reject plaintext connections if necessary
-			if p.listenerForceSsl && !isSsl {
+			if p.listenerForceTls && !isSsl {
 
 				// Set error details to be forwarded to client
 				clientErrMsg = &pgconn.PgError{
@@ -511,7 +491,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.SSLRequest:
 
 			// Reject SSL encryption request, if not desired
-			if tlsClient == nil {
+			if p.listenerTlsConf == nil {
 
 				// Reject SSL encryption request
 				_, errWrite := client.Write([]byte{'N'})
@@ -522,6 +502,26 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Continue with next startup message
 				break
+			}
+
+			// Patch TLS config to select an applicable certificate based on the SNI indicated by the client hello.
+			p.listenerTlsConf.GetCertificate = func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
+
+				// Store SNI sent by client
+				sni = t.ServerName
+
+				// Get listener config based on SNI
+				listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
+				if !okListenerConfig {
+					if t.ServerName == "" {
+						return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
+					} else {
+						return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
+					}
+				}
+
+				// Return related certificate
+				return &listenerConfig.Certificate, nil
 			}
 
 			// Set SSL flag
@@ -536,7 +536,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Execute SSL handshake
 			var errCertificate *ErrCertificate
-			clientTls := tls.Server(client, tlsClient)
+			clientTls := tls.Server(client, p.listenerTlsConf)
 			errClientTls := clientTls.Handshake()
 			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, net.ErrClosed) ||
 				errors.Is(errClientTls, syscall.ECONNRESET) || errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
@@ -675,7 +675,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log error and return
-		logger.Errorf("Client startup failed: Invalid origin '%s' for SNI.", host)
+		logger.Infof("Client startup failed: Invalid origin '%s' for SNI.", host)
 		return // Abort in case of communication error
 	}
 
