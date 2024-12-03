@@ -375,7 +375,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		if errors.Is(errSend, net.ErrClosed) {
 			// Connection already closed
 		} else if errSend != nil {
-			logger.Errorf("Could not return fatal error to client: %s.", errSend)
+			logger.Errorf("Could not return fatal error to client: %s\n%s", errSend, errPg)
 		}
 	}
 
