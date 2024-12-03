@@ -325,17 +325,40 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 	}()
 
-	// Set initial deadline for client to complete handshake
-	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
-	if errDeadline != nil {
-		logger.Errorf("Could not set client deadline: %s.", errDeadline)
-	}
-
 	// Log initial message
 	logger.Infof("Client connected from '%s'", client.RemoteAddr())
 
 	// Prepare memory to remember SNI sent by client
 	sni := ""
+
+	// Prepare copy of listener config and set GetCertificate to select an applicable certificate based
+	// on the SNI indicated by the client hello for local goroutine. Must be a copy to avoid parallel
+	// access to local sni variables.
+	tlsConf := p.listenerTlsConf.Clone()
+	tlsConf.GetCertificate = func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
+
+		// Store SNI sent by client
+		sni = t.ServerName
+
+		// Get listener config based on SNI
+		listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
+		if !okListenerConfig {
+			if t.ServerName == "" {
+				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
+			} else {
+				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
+			}
+		}
+
+		// Return related certificate
+		return &listenerConfig.Certificate, nil
+	}
+
+	// Set initial deadline for client to complete handshake
+	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
+	if errDeadline != nil {
+		logger.Errorf("Could not set client deadline: %s.", errDeadline)
+	}
 
 	// Prepare client backend to receive client messages
 	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(client), client)
@@ -491,7 +514,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.SSLRequest:
 
 			// Reject SSL encryption request, if not desired
-			if p.listenerTlsConf == nil {
+			if tlsConf == nil {
 
 				// Reject SSL encryption request
 				_, errWrite := client.Write([]byte{'N'})
@@ -502,26 +525,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Continue with next startup message
 				break
-			}
-
-			// Patch TLS config to select an applicable certificate based on the SNI indicated by the client hello.
-			p.listenerTlsConf.GetCertificate = func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
-
-				// Store SNI sent by client
-				sni = t.ServerName
-
-				// Get listener config based on SNI
-				listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
-				if !okListenerConfig {
-					if t.ServerName == "" {
-						return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
-					} else {
-						return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
-					}
-				}
-
-				// Return related certificate
-				return &listenerConfig.Certificate, nil
 			}
 
 			// Set SSL flag
@@ -536,7 +539,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Execute SSL handshake
 			var errCertificate *ErrCertificate
-			clientTls := tls.Server(client, p.listenerTlsConf)
+			clientTls := tls.Server(client, tlsConf)
 			errClientTls := clientTls.Handshake()
 			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, net.ErrClosed) ||
 				errors.Is(errClientTls, syscall.ECONNRESET) || errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
