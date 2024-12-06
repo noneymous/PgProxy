@@ -1148,6 +1148,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		var statementCache = make(map[string]string)
 
 		// Loop and listen for client requests
+		var queryBound string // The query currently referenced by the Bind command in extended query flow
 		for {
 
 			// Receive from client
@@ -1177,7 +1178,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Prepare data
 				switch q := r.(type) {
-				case *pgproto3.Query:
+				case *pgproto3.Query: // Simple message flow, client asking to execute a query string, short version of Parse-Bind-Execute-Sync
 
 					// Split multi-query into single SQL statements
 					queries := splitQueries(q.String)
@@ -1204,25 +1205,29 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						pgConn.QueryInProgress = true
 					}
 
-				case *pgproto3.Parse:
+				case *pgproto3.Parse: // Client requesting to parse a prepared statement
 					logger.Debugf("Request  Type '%T', registering query.", r)
 
 					// Add query to prepared statement cache
 					statementCache[q.Name] = trimEmptySyntax(q.Query)
 
-				case *pgproto3.Bind: // Client requesting to execute a previously parsed/prepared statement
-					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+				case *pgproto3.Bind: // Client requesting to load a previously parsed prepared statement
+					logger.Debugf("Request  Type '%T', loading query.", r)
 
 					// Retrieve associated query from statement cache
-					query, okQuery := statementCache[q.PreparedStatement]
-					if !okQuery {
+					var okQueryBound bool
+					queryBound, okQueryBound = statementCache[q.PreparedStatement]
+					if !okQueryBound {
 						logger.Errorf("Reference '%s' not existing in statement cache.", q.PreparedStatement)
 					}
 
+				case *pgproto3.Execute: // Client requesting to execute the loaded statement
+					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+
 					// Add query to statement sequence
 					statementSequence = append(statementSequence, &Statement{
-						Query:      query,
-						QueryInput: query,
+						Query:      queryBound,
+						QueryInput: queryBound,
 						Start:      time.Now(),
 					})
 
