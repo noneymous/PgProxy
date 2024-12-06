@@ -395,10 +395,19 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Log and execute action
 		logger.Debugf("Forwarding error response to client.")
 		errSend := clientBackend.Send(errResp)
-		if errors.Is(errSend, net.ErrClosed) {
-			// Connection already closed
+
+		// Log error with respective criticality
+		var opError *net.OpError
+		if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
+			logger.Debugf("Could not forward error, client connection terminated.")
+		} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
+			logger.Infof("Could not forward error, client connection terminated due to inactivity.")
+		} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
+			logger.Debugf("Could not forward error, client connection already closed.")
+		} else if errors.As(errSend, &opError) {
+			logger.Debugf("Could not forward error, client connection terminated: %s", opError)
 		} else if errSend != nil {
-			logger.Errorf("Could not return fatal error to client: %s\n%s", errSend, errPg)
+			logger.Errorf("Could not forward error to client: %s\n%s", errSend, errPg)
 		}
 	}
 
@@ -541,8 +550,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			var errCertificate *ErrCertificate
 			clientTls := tls.Server(client, tlsConf)
 			errClientTls := clientTls.Handshake()
-			if errors.Is(errClientTls, io.EOF) || errors.Is(errClientTls, net.ErrClosed) ||
-				errors.Is(errClientTls, syscall.ECONNRESET) || errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
+			if errors.Is(errClientTls, io.EOF) || // Connection closed by client
+				errors.Is(errClientTls, net.ErrClosed) || // Connection already closed by PgProxy
+				errors.Is(errClientTls, syscall.ECONNRESET) ||
+				errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
 				_ = clientTls.Close()
 				logger.Debugf("Client terminated connection.")
 				return
@@ -1149,8 +1160,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Client terminated connection.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
-				} else if errors.Is(errR, net.ErrClosed) { // Connection closed by PgProxy
-					// Connection closed by PgProxy
+				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Client connection already closed.")
 				} else if errors.As(errR, &opError) {
 					logger.Infof("Client connection terminated: %s", opError)
 				} else { // Unexpected error
@@ -1310,8 +1321,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Log error with respective criticality
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
 					logger.Infof("Database terminated connection: %s.", errR)
-				} else if errors.Is(errR, net.ErrClosed) { // Connection closed by PgProxy
-					// Connection closed by PgProxy
+				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Client connection already closed.")
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from server failed: %s.", errR)
 
@@ -1486,8 +1497,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errSend != nil {
 
 				// Log error with respective criticality
-				if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
+				var opError *net.OpError
+				if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
+					logger.Debugf("Client connection terminated.")
+				} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Client connection terminated due to inactivity.")
+				} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Client connection already closed.")
+				} else if errors.As(errSend, &opError) {
+					logger.Debugf("Client connection terminated: %s", opError)
 				} else { // Unexpected error
 					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
