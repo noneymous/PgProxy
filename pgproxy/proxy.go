@@ -700,7 +700,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	address := fmt.Sprintf("%s:%d", listenerConfig.Database.Host, listenerConfig.Database.Port)
 
 	// Dial backend based on startup data
-	connDatabase, errDatabase := net.Dial("tcp", address)
+	database, errDatabase := net.Dial("tcp", address)
 	if errDatabase != nil {
 
 		// Set error details to be forwarded to client
@@ -715,11 +715,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Close database connection at the end, if still open
-	defer func() { _ = connDatabase.Close() }()
+	defer func() { _ = database.Close() }()
 
 	// Prepare database frontend to receive database messages
-	databaseReader := pgproto3.NewChunkReader(connDatabase)
-	databaseFrontend := pgproto3.NewFrontend(databaseReader, connDatabase)
+	databaseReader := pgproto3.NewChunkReader(database)
+	databaseFrontend := pgproto3.NewFrontend(databaseReader, database)
 
 	/////////////////////////////////////////////////
 	// Upgrade database connection to SSL, if desired
@@ -786,7 +786,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		} else if rDatabase[0] == 'S' {
 
 			// Execute SSL handshake
-			databaseTls := tls.Client(connDatabase, tlsDatabase)
+			databaseTls := tls.Client(database, tlsDatabase)
 			errDatabaseTls := databaseTls.Handshake()
 			if errDatabaseTls != nil {
 				_ = databaseTls.Close()
@@ -1075,7 +1075,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		User:             startupRaw.Parameters["user"],
 		Application:      startupRaw.Parameters["application_name"],
 		Timestamp:        time.Now(),
-		ConnectionDb:     connDatabase,
+		ConnectionDb:     database,
 		ConnectionClient: client,
 	}
 
@@ -1158,13 +1158,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Log error with respective criticality
 				var opError *net.OpError
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by client
-					logger.Debugf("Client terminated connection.")
+					logger.Debugf("Could not read from clinet, connection terminated.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
-					logger.Infof("Client connection terminated due to inactivity.")
+					logger.Infof("Could not read from clinet, connection terminated due to inactivity.")
 				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
-					logger.Debugf("Client connection already closed.")
+					logger.Debugf("Could not read from clinet, connection already closed.")
 				} else if errors.As(errR, &opError) {
-					logger.Infof("Client connection terminated: %s", opError)
+					logger.Debugf("Could not read from clinet, connection terminated: %s", opError)
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from client failed: %s.", errR)
 				}
@@ -1327,7 +1327,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
 					logger.Infof("Database terminated connection: %s.", errR)
 				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
-					logger.Debugf("Client connection already closed.")
+					logger.Debugf("Database connection already closed.")
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from server failed: %s.", errR)
 
@@ -1504,13 +1504,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Log error with respective criticality
 				var opError *net.OpError
 				if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
-					logger.Debugf("Client connection terminated.")
+					logger.Debugf("Could not send to client, connection terminated.")
 				} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
-					logger.Infof("Client connection terminated due to inactivity.")
+					logger.Infof("Could not send to client, connection terminated due to inactivity.")
 				} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
-					logger.Debugf("Client connection already closed.")
+					logger.Debugf("Could not send to client, connection already closed.")
 				} else if errors.As(errSend, &opError) {
-					logger.Debugf("Client connection terminated: %s", opError)
+					logger.Debugf("Could not send to client, connection terminated: %s", opError)
 				} else { // Unexpected error
 					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
@@ -1544,7 +1544,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	logger.Debugf("Waiting for remaining receiver.")
 
 	// Close client and database connections to resolve potentially blocking Receive() calls in goroutines
-	_ = connDatabase.Close()
+	_ = database.Close()
 	_ = client.Close()
 
 	// Read remaining done signal to unblock remaining receiver goroutine. There are always two,
