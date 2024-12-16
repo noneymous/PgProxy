@@ -481,6 +481,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if !okPgConn {
 				logger.Infof("Cancel request for unknown connection '%T'.", keyData)
 				return // Abort in case of communication error
+			} else {
+				logger.Infof("Cancel request for connection '%s'.", k)
 			}
 
 			// Prepare cancel data
