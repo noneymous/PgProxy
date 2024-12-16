@@ -6,12 +6,12 @@ require (
 	github.com/davecgh/go-spew v1.1.1
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgproto3/v2 v2.3.3
-	github.com/lithammer/shortuuid/v4 v4.0.0
+	github.com/lithammer/shortuuid/v4 v4.2.0
 	github.com/noneymous/go-sqlfmt v0.0.0-20241125135313-aed50bb33bad
 	github.com/orcaman/concurrent-map/v2 v2.0.1
 	github.com/siemens/GoScans v1.0.2
-	golang.org/x/crypto v0.28.0
-	golang.org/x/text v0.19.0
+	golang.org/x/crypto v0.31.0
+	golang.org/x/text v0.21.0
 )
 
 require (
