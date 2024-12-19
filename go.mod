@@ -9,7 +9,7 @@ require (
 	github.com/lithammer/shortuuid/v4 v4.2.0
 	github.com/noneymous/go-sqlfmt v0.0.0-20241125135313-aed50bb33bad
 	github.com/orcaman/concurrent-map/v2 v2.0.1
-	github.com/siemens/GoScans v1.0.2
+	github.com/siemens/GoScans v0.0.0-20241219103026-9e2d8faf13cd
 	golang.org/x/crypto v0.31.0
 	golang.org/x/text v0.21.0
 )
@@ -22,6 +22,6 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
-	golang.org/x/net v0.29.0 // indirect
+	golang.org/x/net v0.32.0 // indirect
 	golang.org/x/tools v0.24.0 // indirect
 )
