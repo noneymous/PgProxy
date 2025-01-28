@@ -508,10 +508,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			_, errRead := pgConn.ConnectionDb.Read(buf)
 			if errRead != nil {
 				var opError *net.OpError
-				if errors.As(errWrite, &opError) {
-					// Ignore operational errors
-				} else if errRead != io.EOF {
+				if errors.Is(errRead, io.EOF) {
 					// Ignore read error
+				} else if errors.As(errRead, &opError) {
+					// Ignore operational errors
 				} else {
 					logger.Errorf("Cancel response failed: %s.", errRead)
 					return // Abort in case of communication error
