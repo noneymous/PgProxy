@@ -1357,6 +1357,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					if statement < len(statementSequence) {
 						query = statementSequence[statement].Query
 						queryInput = statementSequence[statement].QueryInput
+					} else if resp.Code == "57P01" { // Terminating connection due to administrator command
+						// Sent by the database without client trigger, so there might be no associated query.
 					} else {
 						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
 					}
