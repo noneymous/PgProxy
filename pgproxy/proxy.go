@@ -60,7 +60,8 @@ type PgConn struct {
 	TimestampLast    time.Time
 	ConnectionDb     net.Conn
 	ConnectionClient net.Conn
-	QueryInProgress  bool
+	InProgress       bool // Flag whether a query is currently in execution
+	Terminated       bool // Flag whether Termination was requested by client
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
@@ -1194,6 +1195,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Add query to statement sequence
 					for _, query := range queries {
+						logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(query, "\n"), "\n    "))
 						statementSequence = append(statementSequence, &Statement{
 							Query:      query,
 							QueryInput: q.String,
@@ -1204,7 +1206,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Switch connection state to active
 					if len(queries) > 0 {
 						pgConn.TimestampLast = time.Now()
-						pgConn.QueryInProgress = true
+						pgConn.InProgress = true
 					}
 
 				case *pgproto3.Parse: // Client requesting to parse a prepared statement
@@ -1225,6 +1227,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				case *pgproto3.Execute: // Client requesting to execute the loaded statement
 					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+					logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(queryBound, "\n"), "\n    "))
 
 					// Add query to statement sequence
 					statementSequence = append(statementSequence, &Statement{
@@ -1235,7 +1238,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Switch connection state to active
 					pgConn.TimestampLast = time.Now()
-					pgConn.QueryInProgress = true
+					pgConn.InProgress = true
+
+				case *pgproto3.Terminate:
+					logger.Debugf("Request  Type '%T'.", r)
+
+					// Set termination indicator flag
+					pgConn.Terminated = true
 
 				default:
 					logger.Debugf("Request  Type '%T'.", r)
@@ -1494,7 +1503,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Response Type '%T'.", resp)
 
 					// Switch connection state to passive
-					pgConn.QueryInProgress = false
+					pgConn.InProgress = false
 
 				default:
 					logger.Debugf("Response Type '%T'.", resp)
@@ -1565,13 +1574,13 @@ func (p *PgReverseProxy) logConnections() {
 	if p.connectionMap.Count() > 0 {
 
 		// Get current map items as slice
-		items := make([]*PgConn, 0, p.connectionMap.Count())
+		clientConnections := make([]*PgConn, 0, p.connectionMap.Count())
 		for _, v := range p.connectionMap.Items() {
-			items = append(items, v)
+			clientConnections = append(clientConnections, v)
 		}
 
 		// Sort slice
-		slices.SortFunc(items, func(a, b *PgConn) int {
+		slices.SortFunc(clientConnections, func(a, b *PgConn) int {
 			if a.Db == b.Db {
 				return cmp.Compare(a.User, b.User)
 			}
@@ -1579,34 +1588,34 @@ func (p *PgReverseProxy) logConnections() {
 		})
 
 		// Build log message
-		for _, v := range items {
-			user := v.User
+		for _, clientConnection := range clientConnections {
+			user := clientConnection.User
 			if len(user) > 20 {
 				user = user[:17] + "..."
 			}
-			client := v.Application
+			client := clientConnection.Application
 			if len(client) > 25 {
 				client = client[:22] + "..."
 			}
-			last := v.Timestamp
-			if !v.TimestampLast.IsZero() {
-				last = v.TimestampLast
+			last := clientConnection.Timestamp
+			if !clientConnection.TimestampLast.IsZero() {
+				last = clientConnection.TimestampLast
 			}
 			state := "Pssv"
-			if v.QueryInProgress {
+			if clientConnection.InProgress {
 				state = "Actv"
 			}
-			addr := v.ConnectionClient.RemoteAddr().String()
+			addr := clientConnection.ConnectionClient.RemoteAddr().String()
 			host, _, err := net.SplitHostPort(addr)
 			if err == nil {
 				addr = host
 			}
 			msg += fmt.Sprintf(
 				"\n    [%s] | Last: %-19s (%s) | Db: %-10s | Usr: %-20s | Client: '%-25s' | Src: %-15s",
-				v.Uuid,
+				clientConnection.Uuid,
 				last.Format("2006-01-02 15:04:05"),
 				state,
-				v.Db,
+				clientConnection.Db,
 				user,
 				client,
 				addr,
