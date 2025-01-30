@@ -1183,7 +1183,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				switch q := r.(type) {
 				case *pgproto3.Query: // Simple message flow, client asking to execute a query string, short version of Parse-Bind-Execute-Sync
 
-					// Split multi-query into single SQL statements
+					// Split multi-query into single SQL statements.
+					// Single SQL statements are sanitized already.
 					queries := splitQueries(q.String)
 
 					// Log action
@@ -1196,12 +1197,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Add query to statement sequence
 					for _, query := range queries {
 						logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(query, "\n"), "\n    "))
+						logger.Debugf("Queueing bytes: %v", []byte(query))
 						statementSequence = append(statementSequence, &Statement{
 							Query:      query,
 							QueryInput: q.String,
 							Start:      time.Now(),
 						})
 					}
+
+					// Print raw string bytes for debuggability
+					logger.Debugf("Original bytes: %v", []byte(q.String))
 
 					// Switch connection state to active
 					if len(queries) > 0 {
@@ -1322,7 +1327,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					"Responses did not match requests and are off by %d (%d total):\n%s",
 					len(statementSequence)-statement,
 					len(statementSequence),
-					strings.Join(remainingQueries, ";\n"),
+					"    "+strings.Join(remainingQueries, ";\n    "),
 				)
 			}
 		}()
@@ -1777,7 +1782,7 @@ func splitQueries(sql string) []string {
 	queriesSanitized := make([]string, 0, len(queries))
 	for _, query := range queries {
 		query = trimEmptySyntax(query)
-		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
+		if len(query) > 0 {
 			queriesSanitized = append(queriesSanitized, query)
 		}
 	}
