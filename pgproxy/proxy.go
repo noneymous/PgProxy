@@ -345,7 +345,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
 		if !okListenerConfig {
 			if t.ServerName == "" {
-				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI")}
+				return nil, &ErrCertificate{Message: fmt.Sprintf("empty SNI")}
 			} else {
 				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
 			}
@@ -569,7 +569,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				}
 
 				// Log issue and return
-				_ = clientTls.Close()
 				logger.Infof("Client startup failed during SSL handshake: %s.", errClientTls)
 				return
 			} else if errClientTls != nil {
