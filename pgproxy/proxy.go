@@ -1795,7 +1795,7 @@ func splitQueries(sql string) []string {
 func trimEmptySyntax(s string) string {
 	lengthPrev := 0
 	for {
-		s = strings.Trim(s, " \n\t") // Remove all leading and trailing characters that do not have a meaning
+		s = strings.Trim(s, " \n\t\r\f") // Remove all leading and trailing characters that do not have a meaning
 		if len(s) == lengthPrev {
 			return s
 		}

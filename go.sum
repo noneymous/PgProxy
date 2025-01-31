@@ -24,6 +24,7 @@ github.com/lithammer/shortuuid/v4 v4.2.0 h1:LMFOzVB3996a7b8aBuEXxqOBflbfPQAiVzkI
 github.com/lithammer/shortuuid/v4 v4.2.0/go.mod h1:D5noHZ2oFw/YaKCfGy0YxyE7M0wMbezmMjPdhyEFe6Y=
 github.com/noneymous/go-sqlfmt v0.0.0-20250128102410-b567f1996292 h1:7IBOmMtt/l/guQXRM898TZlU87DWXq6WjRPF5Rc1Rng=
 github.com/noneymous/go-sqlfmt v0.0.0-20250128102410-b567f1996292/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
+github.com/noneymous/go-sqlfmt v0.0.0-20250131144227-7b8049d15c88/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
 github.com/orcaman/concurrent-map/v2 v2.0.1/go.mod h1:9Eq3TG2oBe5FirmYWQfYO5iH1q0Jv47PLaNK++uCdOM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
