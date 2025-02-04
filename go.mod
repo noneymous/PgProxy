@@ -7,7 +7,7 @@ require (
 	github.com/jackc/pgconn v1.14.3
 	github.com/jackc/pgproto3/v2 v2.3.3
 	github.com/lithammer/shortuuid/v4 v4.2.0
-	github.com/noneymous/go-sqlfmt v0.0.0-20250131144227-7b8049d15c88
+	github.com/noneymous/go-sqlfmt v0.0.0-20250204120627-5bde34133905
 	github.com/orcaman/concurrent-map/v2 v2.0.1
 	github.com/siemens/GoScans v0.0.0-20241219103026-9e2d8faf13cd
 	golang.org/x/crypto v0.31.0
