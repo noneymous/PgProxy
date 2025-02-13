@@ -22,8 +22,8 @@ github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7Ulw
 github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761/go.mod h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=
 github.com/lithammer/shortuuid/v4 v4.2.0 h1:LMFOzVB3996a7b8aBuEXxqOBflbfPQAiVzkIcHO0h8c=
 github.com/lithammer/shortuuid/v4 v4.2.0/go.mod h1:D5noHZ2oFw/YaKCfGy0YxyE7M0wMbezmMjPdhyEFe6Y=
-github.com/noneymous/go-sqlfmt v0.0.0-20250204120627-5bde34133905 h1:80/NB9G6fEDmbRUp3dOZR8tlkqE6DEZqFnf7no67VNA=
-github.com/noneymous/go-sqlfmt v0.0.0-20250204120627-5bde34133905/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
+github.com/noneymous/go-sqlfmt v0.0.0-20250213120813-323c85548dba h1:dhKp/mk+zcEsGtA1RARLjLMfDjxqvPM+uHT/VKpty1g=
+github.com/noneymous/go-sqlfmt v0.0.0-20250213120813-323c85548dba/go.mod h1:+Ga3gCqDO8Cw1fKLmFZ3UYgJ1z1Nb7J5bIJwqNrANTI=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
 github.com/orcaman/concurrent-map/v2 v2.0.1/go.mod h1:9Eq3TG2oBe5FirmYWQfYO5iH1q0Jv47PLaNK++uCdOM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
