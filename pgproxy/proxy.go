@@ -75,14 +75,14 @@ type PgReverseProxy struct {
 	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
-	connectionMap cmap.ConcurrentMap[string, *PgConn] // Map to lookup network connections by backend key data
-	connectionCnt uint                                // Counter for currently active proxy connections
-
-	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
 	ctxCancelFunc context.CancelFunc // Cancel function for context
 
-	connectionsLogTicker *time.Ticker // Ticker regularly logging currently active connections
+	wg      sync.WaitGroup // Wait group for all goroutines across all client connections
+	wgCount Counter        // Counter for currently active wait groups (proxy connections)
+
+	connections          cmap.ConcurrentMap[string, *PgConn] // Map to lookup network connections by backend key data
+	connectionsLogTicker *time.Ticker                        // Ticker regularly logging currently active connections
 
 	fnMonitoring func(
 		loggerClient scanUtils.Logger,
@@ -127,8 +127,8 @@ func Init(
 		listenerConfigs:      make(map[string]Sni),
 		ctx:                  ctx,
 		ctxCancelFunc:        ctxCancel,
+		connections:          cmap.New[*PgConn](),
 		connectionsLogTicker: time.NewTicker(intervalConnectionsLog),
-		connectionMap:        cmap.New[*PgConn](),
 	}
 
 	// Launch background routine regularly printing currently active connections
@@ -202,8 +202,8 @@ func (p *PgReverseProxy) Stop() {
 
 	// Log shutdown
 	p.logger.Infof("PgProxy shutting down.")
-	if p.connectionCnt > 0 {
-		p.logger.Debugf("PgProxy has %d active connections left.", p.connectionCnt)
+	if p.wgCount.Value() > 0 {
+		p.logger.Debugf("PgProxy has %d active connections left.", p.wgCount.Value())
 		p.connectionsLogTicker.Reset(intervalConnectionsLog)
 		p.logConnections()
 	}
@@ -285,16 +285,18 @@ func (p *PgReverseProxy) Serve() { // Log termination
 			continue // Continue with next connection attempt
 		}
 
-		// Increase connection counter
-		p.connectionCnt += 1
+		// Increment wait group and counter
+		p.wg.Add(1)
+		p.wgCount.Inc()
 
 		// Handle client connection
 		go func() {
 
-			// Decrease counter afterward
-			defer func() { p.connectionCnt -= 1 }()
+			// Make sure wait group and counter are decremented at the end again
+			defer p.wg.Done()
+			defer p.wgCount.Dec()
 
-			// Handle connection
+			// Handle client
 			p.handleClient(client)
 		}()
 	}
@@ -302,10 +304,6 @@ func (p *PgReverseProxy) Serve() { // Log termination
 
 // handleClient processes a single client connection and proxies communication between a client and a database
 func (p *PgReverseProxy) handleClient(client net.Conn) {
-
-	// Add to wait group and make sure it's decremented at the end again
-	p.wg.Add(1)
-	defer p.wg.Done()
 
 	// Generate UUID for context
 	uuid := shortuuid.New()[0:10] // Shorten uuid, doesn't need to be that long
@@ -478,7 +476,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			k := generateKey(&keyData)
 
 			// Get connection to cancel by key
-			pgConn, okPgConn := p.connectionMap.Get(k)
+			pgConn, okPgConn := p.connections.Get(k)
 			if !okPgConn {
 				logger.Infof("Cancel request for unknown connection '%T'.", keyData)
 				return // Abort in case of communication error
@@ -1082,12 +1080,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Store connection under key
-	p.connectionMap.Set(k, &pgConn)
+	p.connections.Set(k, &pgConn)
 
 	// Make sure entry is cleaned from map after database connection is terminated
 	defer func() {
 		logger.Debugf("Removing cached connection details.")
-		p.connectionMap.Remove(k)
+		p.connections.Remove(k)
 	}()
 
 	// Print current connections
@@ -1575,11 +1573,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 // logConnections prints currently active connections utilizing the logger
 func (p *PgReverseProxy) logConnections() {
 	msg := "Active database connections:"
-	if p.connectionMap.Count() > 0 {
+	if p.connections.Count() > 0 {
 
 		// Get current map items as slice
-		clientConnections := make([]*PgConn, 0, p.connectionMap.Count())
-		for _, v := range p.connectionMap.Items() {
+		clientConnections := make([]*PgConn, 0, p.connections.Count())
+		for _, v := range p.connections.Items() {
 			clientConnections = append(clientConnections, v)
 		}
 
@@ -1629,7 +1627,7 @@ func (p *PgReverseProxy) logConnections() {
 		// Log message
 		p.logger.Debugf(msg)
 	} else {
-		msg += fmt.Sprintf(" %d", p.connectionCnt)
+		msg += fmt.Sprintf(" %d", p.wgCount.Value())
 		p.logger.Debugf(msg)
 	}
 }
@@ -1788,19 +1786,6 @@ func splitQueries(sql string) []string {
 
 	// Return split queries
 	return queriesSanitized
-}
-
-// trimEmptySyntax trims a given character set from the beginning and end of a
-// string and repeats until no changes are detected anymore
-func trimEmptySyntax(s string) string {
-	lengthPrev := 0
-	for {
-		s = strings.Trim(s, " \n\t\r\f") // Remove all leading and trailing characters that do not have a meaning
-		if len(s) == lengthPrev {
-			return s
-		}
-		lengthPrev = len(s)
-	}
 }
 
 // prettify returns a formatted SQL query string and a list of database tables it is targeting. An SQL query
