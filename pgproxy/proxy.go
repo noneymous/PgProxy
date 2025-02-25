@@ -1230,6 +1230,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.Execute: // Client requesting to execute the loaded statement
 					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
 					logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(queryBound, "\n"), "\n    "))
+					logger.Debugf("Queueing bytes: %v", []byte(queryBound))
 
 					// Add query to statement sequence
 					statementSequence = append(statementSequence, &Statement{
@@ -1896,8 +1897,9 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	if !valid && !warned {
 		warned = true
 		logger.Warningf(
-			"Could not prettify query, output diverges:\n%s",
+			"Could not prettify query, output diverges:\n%s\n    |!=--->\n%s",
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+			"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
 		)
 		// Warn about issue, but continue
 	}
