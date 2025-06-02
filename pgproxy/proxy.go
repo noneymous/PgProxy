@@ -1310,7 +1310,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Check if there were remaining queries at the end and warn about for debugging purposes
 		defer func() {
-			if statement < len(statementSequence) {
+			if pgConn.Terminated {
+				// Termination requested, it's normal that one or more submitted queries might not get executed
+			} else if statement < len(statementSequence) {
 
 				// Extract queries from remaining statements
 				remainingQueries := make([]string, 0, len(statementSequence)-statement)
@@ -1355,6 +1357,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Return and end database receiver
 				return
 			}
+			logger.Debugf("Received frontend message: %s", spew.Sdump(r))
 
 			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
@@ -1369,8 +1372,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					if statement < len(statementSequence) {
 						query = statementSequence[statement].Query
 						queryInput = statementSequence[statement].QueryInput
-					} else if resp.Code == "57P01" { // Terminating connection due to administrator command
+					} else if resp.Code == "57P01" { // admin_shutdown - Terminating connection due to administrator command
 						// Sent by the database without client trigger, so there might be no associated query.
+					} else if resp.Code == "08P01" { // protocol_violation - Client sent unexpected message
+						// Sent by the database after an invalid frontend message, so query might be missing or unknown
+						logger.Errorf("Client sent %s", resp.Message) // TODO debug, verify and remove log message
 					} else {
 						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
 					}
@@ -1514,6 +1520,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Forward to client
+			logger.Debugf("Forwarding frontend message.")
 			errSend := clientBackend.Send(r)
 			if errSend != nil {
 
