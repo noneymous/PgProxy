@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	scanUtils "github.com/siemens/GoScans/utils"
 	"log"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ var snis = []pgproxy.Sni{
 			Port:    5432,                  // The database port  to proxy the client to
 			SslMode: "prefer",              // one out of pgproxy.SslModes
 		},
+		AllowedOrigins: nil, // Option to restrict access to SNI for a list of origin IPs
 	},
 }
 
@@ -40,21 +43,32 @@ func main() {
 		}
 	}()
 
-	// Define client timeout duration
-	clientTimeout := time.Second * 60 * 10
+	// Prepare some reasonable TLS config
+	tlsConf := &tls.Config{
+		MinVersion:       tls.VersionTLS12,
+		MaxVersion:       tls.VersionTLS13,
+		CurvePreferences: []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+		CipherSuites: []uint16{
+			// Limit cipher suites to secure ones https://ciphersuite.info/cs/
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+	}
 
 	// Initialize PgProxy
-	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, false, true, clientTimeout)
+	pgProxy, errPgProxy := pgproxy.Init(logger, 54321, tlsConf, false, true)
 	if errPgProxy != nil {
 		logger.Errorf("Could not initialize PgProxy: %s.", errPgProxy)
 		return
 	}
 
-	// Log client timeout
-	logger.Infof("Client timeout set to %s.", clientTimeout.String())
-
 	// Register monitoring function (optional)
 	pgProxy.RegisterMonitoring(func(
+		loggerClient scanUtils.Logger, // Internal logger from PgProxy, within the context of a client connection
 		dbName string,
 		dbUser string,
 		dbTables []string,

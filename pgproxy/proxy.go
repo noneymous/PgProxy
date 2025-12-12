@@ -2,6 +2,7 @@ package pgproxy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -9,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
 	"github.com/lithammer/shortuuid/v4"
@@ -18,15 +20,18 @@ import (
 	"github.com/noneymous/go-sqlfmt/sqlfmt/parser"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	scanUtils "github.com/siemens/GoScans/utils"
-	"gorm.io/gorm/utils"
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+const intervalConnectionsLog = time.Second * 60
 
 // ErrInternal defines an error message to be returned to the client if there was some internal error
 // Other errors, raised by the database, should be directly returned to the client.
@@ -45,32 +50,42 @@ func (e *ErrCertificate) Error() string {
 }
 
 type PgConn struct {
-	Pid        uint32
-	Sid        uint32
-	User       string
-	Client     string
-	Connection net.Conn
+	Uuid             string // random string identifying log messages of this connection stream
+	Pid              uint32
+	Sid              uint32
+	Db               string
+	User             string
+	Application      string
+	Timestamp        time.Time
+	TimestampLast    time.Time
+	ConnectionDb     net.Conn
+	ConnectionClient net.Conn
+	InProgress       bool // Flag whether a query is currently in execution
+	Terminated       bool // Flag whether Termination was requested by client
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
 // connections and redirecting them to configured database servers, based on SNIs indicated by the client.
 type PgReverseProxy struct {
-	log                scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
+	logger             scanUtils.Logger // PgProxy internal logger. Can be any fulfilling the specified logger interface
 	listener           net.Listener     // PgProxy net listener listening for incoming client connections to be proxied
 	listenerPort       uint             // PgProxy port to listen on
-	listenerForceSsl   bool             // PgProxy flag whether to force SSL or allow plaintext connections
+	listenerTlsConf    *tls.Config      // TLS configuration to use to service clients
+	listenerForceTls   bool             // PgProxy flag whether to force SSL or allow plaintext connections
 	listenerDefaultSni bool             // PgProxy flag whether to enable first listener config as default or to demand suitable SNI for incoming SSL connections
-	listenerTimeout    time.Duration    // Inactivity timeout for connected clients
 	listenerConfigs    map[string]Sni   // List of SNI certificates and database configurations to redirect clients
 
-	connectionMap cmap.ConcurrentMap[string, PgConn] // Map to lookup network connections by backend key data
-	connectionCtr uint                               // Counter for currently active proxy connections
-
-	wg            sync.WaitGroup     // Wait group for all goroutines across all client connections
 	ctx           context.Context    // Context within the PgProxy is running, can be cancelled to shut down
 	ctxCancelFunc context.CancelFunc // Cancel function for context
 
+	wg      sync.WaitGroup // Wait group for all goroutines across all client connections
+	wgCount Counter        // Counter for currently active wait groups (proxy connections)
+
+	connections          cmap.ConcurrentMap[string, *PgConn] // Map to lookup network connections by backend key data
+	connectionsLogTicker *time.Ticker                        // Ticker regularly logging currently active connections
+
 	fnMonitoring func(
+		loggerClient scanUtils.Logger,
 		dbName string,
 		dbUser string,
 		dbTables []string,
@@ -85,11 +100,11 @@ type PgReverseProxy struct {
 
 // Init initializes the Postgres reverse proxy
 func Init(
-	log scanUtils.Logger,
+	logger scanUtils.Logger,
 	listenerPort uint,
-	listenerForceSsl bool, // Whether to reject plain text connections
+	listenerTlsConf *tls.Config,
+	listenerForceTls bool, // Whether to reject plain text connections
 	listenerDefaultSni bool, // Whether to reject SSL connections without SNI. Without SNI the first SNI configuration would be applied as the default.
-	listenerTimeout time.Duration,
 ) (*PgReverseProxy, error) {
 
 	// Open listener
@@ -103,17 +118,33 @@ func Init(
 
 	// Prepare PgProxy
 	pgProxy := PgReverseProxy{
-		log:                log,
-		listener:           listener,
-		listenerPort:       listenerPort,
-		listenerForceSsl:   listenerForceSsl,
-		listenerDefaultSni: listenerDefaultSni,
-		listenerTimeout:    listenerTimeout,
-		listenerConfigs:    make(map[string]Sni),
-		ctx:                ctx,
-		ctxCancelFunc:      ctxCancel,
-		connectionMap:      cmap.New[PgConn](),
+		logger:               logger,
+		listener:             listener,
+		listenerPort:         listenerPort,
+		listenerTlsConf:      listenerTlsConf,
+		listenerForceTls:     listenerForceTls,
+		listenerDefaultSni:   listenerDefaultSni,
+		listenerConfigs:      make(map[string]Sni),
+		ctx:                  ctx,
+		ctxCancelFunc:        ctxCancel,
+		connections:          cmap.New[*PgConn](),
+		connectionsLogTicker: time.NewTicker(intervalConnectionsLog),
 	}
+
+	// Launch background routine regularly printing currently active connections
+	go func() {
+		pgProxy.logger.Debugf("Connections logger started.")
+		pgProxy.logConnections()
+		for {
+			select {
+			case <-pgProxy.ctx.Done():
+				pgProxy.logger.Debugf("Connections logger terminated.")
+				return
+			case <-pgProxy.connectionsLogTicker.C:
+				pgProxy.logConnections()
+			}
+		}
+	}()
 
 	// Return initialized PgProxy
 	return &pgProxy, nil
@@ -152,6 +183,7 @@ func (p *PgReverseProxy) RegisterSni(sni ...Sni) error {
 
 // RegisterMonitoring can be used to configure a custom function for user activity logging or monitoring
 func (p *PgReverseProxy) RegisterMonitoring(f func(
+	loggerClient scanUtils.Logger,
 	dbName string,
 	dbUser string,
 	dbTables []string,
@@ -169,9 +201,11 @@ func (p *PgReverseProxy) RegisterMonitoring(f func(
 func (p *PgReverseProxy) Stop() {
 
 	// Log shutdown
-	p.log.Infof("PgProxy shutting down.")
-	if p.connectionCtr > 0 {
-		p.log.Debugf("PgProxy has %d active connections left.", p.connectionCtr)
+	p.logger.Infof("PgProxy shutting down.")
+	if p.wgCount.Value() > 0 {
+		p.logger.Debugf("PgProxy has %d active connections left.", p.wgCount.Value())
+		p.connectionsLogTicker.Reset(intervalConnectionsLog)
+		p.logConnections()
 	}
 
 	// Cancel context
@@ -182,7 +216,7 @@ func (p *PgReverseProxy) Stop() {
 
 	// Wait for active connections to be terminated
 	p.wg.Wait()
-	p.log.Debugf("PgProxy stopped.")
+	p.logger.Debugf("PgProxy stopped.")
 }
 
 // Serve listens for incoming connections and processes them in an asynchronous goroutine
@@ -190,7 +224,7 @@ func (p *PgReverseProxy) Serve() { // Log termination
 
 	// Check if at least one certificate is set
 	if len(p.listenerConfigs) == 0 {
-		p.log.Errorf("PgProxy certificates not configured.")
+		p.logger.Errorf("PgProxy certificates not configured.")
 		return
 	} else {
 		msg := fmt.Sprintf("PgProxy certificates configured on port %d:", p.listenerPort)
@@ -212,16 +246,19 @@ func (p *PgReverseProxy) Serve() { // Log termination
 
 			// Append message
 			msg += fmt.Sprintf("\n    %s:", k)
-			msg += fmt.Sprintf("\n          Fingerprint   : %s", hex.EncodeToString(certFingerprint[:]))
-			msg += fmt.Sprintf("\n          Common Name   : %s", v.CertificateX509.Subject.CommonName)
+			msg += fmt.Sprintf("\n          Fingerprint    : %s", hex.EncodeToString(certFingerprint[:]))
+			msg += fmt.Sprintf("\n          Common Name    : %s", v.CertificateX509.Subject.CommonName)
 			if subjAltNames != "" {
-				msg += fmt.Sprintf("\n          Subj Alt Names: %s", subjAltNames)
+				msg += fmt.Sprintf("\n          Subj Alt Names : %s", subjAltNames)
 			}
 			if subjAltIps != "" {
-				msg += fmt.Sprintf("\n          Subj Alt IPs  : %s", subjAltIps)
+				msg += fmt.Sprintf("\n          Subj Alt IPs   : %s", subjAltIps)
+			}
+			if len(v.AllowedOrigins) > 0 {
+				msg += fmt.Sprintf("\n          Allowed Origins: %s", strings.Join(v.AllowedOrigins, ", "))
 			}
 		}
-		p.log.Debugf(msg)
+		p.logger.Debugf(msg)
 	}
 
 	// Continuously listen for incoming connections
@@ -232,32 +269,34 @@ func (p *PgReverseProxy) Serve() { // Log termination
 		if errClient != nil {
 
 			// Stop serving if listener got closed
-			if errors.As(errClient, &net.ErrClosed) {
+			if errors.Is(errClient, net.ErrClosed) {
 				return
 			}
 
 			// Ignore timeout errors
 			var ne net.Error
 			if errors.As(errClient, &ne) && ne.Timeout() {
-				p.log.Infof("Client connection failed: %s", errClient)
+				p.logger.Infof("Client connection failed: %s.", errClient)
 				continue // Continue with next connection attempt
 			}
 
 			// Log error
-			p.log.Errorf("Client connection failed: %s", errClient)
+			p.logger.Errorf("Client connection failed: %s.", errClient)
 			continue // Continue with next connection attempt
 		}
 
-		// Increase connection counter
-		p.connectionCtr += 1
+		// Increment wait group and counter
+		p.wg.Add(1)
+		p.wgCount.Inc()
 
 		// Handle client connection
 		go func() {
 
-			// Decrease counter afterward
-			defer func() { p.connectionCtr -= 1 }()
+			// Make sure wait group and counter are decremented at the end again
+			defer p.wg.Done()
+			defer p.wgCount.Dec()
 
-			// Handle connection
+			// Handle client
 			p.handleClient(client)
 		}()
 	}
@@ -266,15 +305,11 @@ func (p *PgReverseProxy) Serve() { // Log termination
 // handleClient processes a single client connection and proxies communication between a client and a database
 func (p *PgReverseProxy) handleClient(client net.Conn) {
 
-	// Add to wait group and make sure it's decremented at the end again
-	p.wg.Add(1)
-	defer p.wg.Done()
-
 	// Generate UUID for context
 	uuid := shortuuid.New()[0:10] // Shorten uuid, doesn't need to be that long
 
 	// Get tagged logger for connection stream
-	logger := scanUtils.NewTaggedLogger(p.log, uuid)
+	logger := scanUtils.NewTaggedLogger(p.logger, uuid)
 
 	// Log final message for this interaction
 	defer func() { logger.Infof("Proxying communication ended.") }()
@@ -289,35 +324,39 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 	}()
 
-	// Set deadline initial deadline for client to complete handshake
-	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
-	if errDeadline != nil {
-		logger.Errorf("Setting client deadline failed: %s", errDeadline)
-	}
-
 	// Log initial message
 	logger.Infof("Client connected from '%s'", client.RemoteAddr())
 
 	// Prepare memory to remember SNI sent by client
 	sni := ""
 
-	// Prepare TLS configuration for client connections. TLS config contains a custom function
-	// to select an applicable certificate based on the SNI indicated by the client hello.
-	tlsClient := &tls.Config{
-		GetCertificate: func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// Prepare copy of listener config and set GetCertificate to select an applicable certificate based
+	// on the SNI indicated by the client hello for local goroutine. Must be a copy to avoid parallel
+	// access to local sni variables.
+	tlsConf := p.listenerTlsConf.Clone()
+	tlsConf.GetCertificate = func(t *tls.ClientHelloInfo) (*tls.Certificate, error) {
 
-			// Store SNI sent by client
-			sni = t.ServerName
+		// Store SNI sent by client
+		sni = t.ServerName
 
-			// Get listener config based on SNI
-			listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
-			if !okListenerConfig {
-				return nil, &ErrCertificate{Message: fmt.Sprintf("no certificate for '%s'", t.ServerName)}
+		// Get listener config based on SNI
+		listenerConfig, okListenerConfig := p.listenerConfigs[t.ServerName]
+		if !okListenerConfig {
+			if t.ServerName == "" {
+				return nil, &ErrCertificate{Message: fmt.Sprintf("empty SNI")}
+			} else {
+				return nil, &ErrCertificate{Message: fmt.Sprintf("invalid SNI '%s'", t.ServerName)}
 			}
+		}
 
-			// Return related certificate
-			return &listenerConfig.Certificate, nil
-		},
+		// Return related certificate
+		return &listenerConfig.Certificate, nil
+	}
+
+	// Set initial deadline for client to complete handshake
+	errDeadline := client.SetDeadline(time.Now().Add(time.Second * 10))
+	if errDeadline != nil {
+		logger.Errorf("Could not set client deadline: %s.", errDeadline)
 	}
 
 	// Prepare client backend to receive client messages
@@ -353,10 +392,21 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log and execute action
-		logger.Debugf("Returning fatal error to client.")
+		logger.Debugf("Forwarding error response to client.")
 		errSend := clientBackend.Send(errResp)
-		if errSend != nil {
-			logger.Errorf("Could not return fatal error to client: %s.", errSend)
+
+		// Log error with respective criticality
+		var opError *net.OpError
+		if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
+			logger.Debugf("Could not forward error, client connection terminated.")
+		} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
+			logger.Infof("Could not forward error, client connection terminated due to inactivity.")
+		} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
+			logger.Debugf("Could not forward error, client connection already closed.")
+		} else if errors.As(errSend, &opError) {
+			logger.Debugf("Could not forward error, client connection terminated: %s", opError)
+		} else if errSend != nil {
+			logger.Errorf("Could not forward error to client: %s\n%s", errSend, errPg)
 		}
 	}
 
@@ -379,11 +429,18 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Read startup message
 		startup, errStartup := clientBackend.ReceiveStartupMessage()
-		if errors.Is(errStartup, io.EOF) { // Connection closed by client
+		if errors.Is(errStartup, io.EOF) || errors.Is(errStartup, syscall.ECONNRESET) { // Connection closed by client
 			logger.Debugf("Client terminated connection.")
 			return
 		} else if errStartup != nil {
-			logger.Errorf("Client startup failed: %s.", errStartup)
+
+			// Set error details to be forwarded to client
+			clientErrMsg = &pgconn.PgError{
+				Code:    "FATAL",
+				Message: "Invalid startup message",
+			}
+
+			logger.Debugf("Client startup failed: %s.", errStartup)
 			return
 		}
 
@@ -391,7 +448,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.StartupMessage:
 
 			// Reject plaintext connections if necessary
-			if p.listenerForceSsl && !isSsl {
+			if p.listenerForceTls && !isSsl {
 
 				// Set error details to be forwarded to client
 				clientErrMsg = &pgconn.PgError{
@@ -410,16 +467,21 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.CancelRequest:
 
 			// Prepare cancellation request
-			key := pgproto3.BackendKeyData{
+			keyData := pgproto3.BackendKeyData{
 				ProcessID: m.ProcessID,
 				SecretKey: m.SecretKey,
 			}
 
+			// Get key
+			k := generateKey(&keyData)
+
 			// Get connection to cancel by key
-			pgConn, okPgConn := p.connectionMap.Get(generateKey(&key))
+			pgConn, okPgConn := p.connections.Get(k)
 			if !okPgConn {
-				logger.Errorf("Cancel request failed: Unknown connection '%T'.", key)
+				logger.Infof("Cancel request for unknown connection '%T'.", keyData)
 				return // Abort in case of communication error
+			} else {
+				logger.Infof("Cancel request for connection '%s'.", k)
 			}
 
 			// Prepare cancel data
@@ -430,27 +492,39 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			binary.BigEndian.PutUint32(buf[12:16], m.SecretKey)
 
 			// Send cancel request on connection
-			_, errWrite := pgConn.Connection.Write(buf)
+			_, errWrite := pgConn.ConnectionDb.Write(buf)
 			if errWrite != nil {
-				logger.Errorf("Cancel request failed: %s.", errWrite)
-				return // Abort in case of communication error
+				var opError *net.OpError
+				if errors.As(errWrite, &opError) {
+					// Ignore operational errors
+				} else {
+					logger.Errorf("Cancel request failed: %s.", errWrite)
+					return // Abort in case of communication error
+				}
 			}
 
 			// Read cancel response from connection
-			_, errRead := pgConn.Connection.Read(buf)
-			if errRead != io.EOF {
-				logger.Errorf("Cancel request failed: %s.", errRead)
-				return // Abort in case of communication error
+			_, errRead := pgConn.ConnectionDb.Read(buf)
+			if errRead != nil {
+				var opError *net.OpError
+				if errors.Is(errRead, io.EOF) {
+					// Ignore read error
+				} else if errors.As(errRead, &opError) {
+					// Ignore operational errors
+				} else {
+					logger.Errorf("Cancel response failed: %s.", errRead)
+					return // Abort in case of communication error
+				}
 			}
 
 			// Log success and abort further communication
 			logger.Infof("Cancel request successful.")
-			return // Abort in case of communication error
+			return
 
 		case *pgproto3.SSLRequest:
 
 			// Reject SSL encryption request, if not desired
-			if tlsClient == nil {
+			if tlsConf == nil {
 
 				// Reject SSL encryption request
 				_, errWrite := client.Write([]byte{'N'})
@@ -474,17 +548,30 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Execute SSL handshake
-			clientTls := tls.Server(client, tlsClient)
+			var errCertificate *ErrCertificate
+			clientTls := tls.Server(client, tlsConf)
 			errClientTls := clientTls.Handshake()
-			if errors.Is(errClientTls, io.EOF) { // Connection closed by client
+			if errors.Is(errClientTls, io.EOF) || // Connection closed by client
+				errors.Is(errClientTls, net.ErrClosed) || // Connection already closed by PgProxy
+				errors.Is(errClientTls, syscall.ECONNRESET) ||
+				errors.Is(errClientTls, os.ErrDeadlineExceeded) { // Connection closed by client
+				_ = clientTls.Close()
 				logger.Debugf("Client terminated connection.")
 				return
-			} else if errors.Is(errClientTls, &ErrCertificate{}) {
-				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
+			} else if errors.As(errClientTls, &errCertificate) {
+
+				// Prepare error to return to the client
+				clientErrMsg = &pgconn.PgError{
+					Code:    "FATAL",
+					Message: "SSL connection with " + errCertificate.Error(),
+				}
+
+				// Log issue and return
+				logger.Infof("Client startup failed during SSL handshake: %s.", errClientTls)
 				return
 			} else if errClientTls != nil {
 				_ = clientTls.Close()
-				logger.Errorf("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
+				logger.Infof("Client startup failed: could not execute SSL handshake: %s.", errClientTls)
 				return // Abort in case of communication error
 			}
 
@@ -520,7 +607,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Log situation and return
-			logger.Infof("Client connection without SNI cannot be dispatched, there is no default database.")
+			logger.Infof("Client connection without SNI cannot be dispatched, there is no default database server.")
 			return
 		} else {
 
@@ -531,22 +618,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Log situation and return
-			logger.Infof("Client connection without SSL/SNI cannot be dispatched, there is no default database.")
+			logger.Infof("Client connection without SSL/SNI cannot be dispatched, there is no default database server.")
 			return
 		}
 	}
 
 	// Log target database derived from connection settings
 	if !isSsl {
-		logger.Debugf("Client connection without SSL dispatching to DEFAULT database.")
+		logger.Debugf("Client connection without SSL dispatching to DEFAULT database server.")
 	} else if sni == "" {
-		logger.Debugf("Client connection without SNI dispatching to DEFAULT database.")
+		logger.Debugf("Client connection without SNI dispatching to DEFAULT database server.")
 	} else {
-		logger.Debugf("Client connection dispatching to database '%s'.", sni)
+		logger.Debugf("Client connection dispatching to database server '%s'.", sni)
 	}
 
 	// Log user requesting connection
-	logger.Debugf("Client connection authenticating as '%s'.", startupRaw.Parameters["user"])
+	logger.Debugf("Client connection to '%s' as '%s'.", startupRaw.Parameters["database"], startupRaw.Parameters["user"])
 
 	// Request password from client
 	logger.Debugf("Requesting authentication password from client.")
@@ -580,18 +667,40 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Prepare database target address
 	listenerConfig, okListenerConfig := p.listenerConfigs[sni]
 	if !okListenerConfig {
-		logger.Errorf("Database startup failed: no database configuration for '%s'.", sni)
+		logger.Errorf("Database startup failed: no database server configuration for SNI '%s'.", sni)
+		return // Abort in case of communication error
+	}
+
+	// Extract IP from remote address
+	host, _, errHost := net.SplitHostPort(client.RemoteAddr().String())
+	if errHost != nil {
+		logger.Errorf("Client startup failed: could not parse remote address '%s'.", client.RemoteAddr().String())
+		return
+	}
+
+	// Check if origin IP is allowed
+	if len(listenerConfig.AllowedOrigins) > 0 &&
+		!scanUtils.StrContained(host, listenerConfig.AllowedOrigins) {
+
+		// Set error details to be forwarded to client
+		clientErrMsg = &pgconn.PgError{
+			Code:    "FATAL",
+			Message: "Connection with invalid origin",
+		}
+
+		// Log error and return
+		logger.Infof("Client startup failed: Invalid origin '%s' for SNI.", host)
 		return // Abort in case of communication error
 	}
 
 	// Log database selection
-	logger.Debugf("Proxying to database '%s'.", listenerConfig.Database.Host)
+	logger.Debugf("Proxying to database server '%s'.", listenerConfig.Database.Host)
 
 	// Build address for connection
 	address := fmt.Sprintf("%s:%d", listenerConfig.Database.Host, listenerConfig.Database.Port)
 
 	// Dial backend based on startup data
-	connDatabase, errDatabase := net.Dial("tcp", address)
+	database, errDatabase := net.Dial("tcp", address)
 	if errDatabase != nil {
 
 		// Set error details to be forwarded to client
@@ -601,16 +710,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Log error and return
-		logger.Errorf("Database startup failed: could not connect to database '%s': %s.", address, errDatabase)
+		logger.Errorf("Database startup failed: could not connect to database server '%s': %s.", address, errDatabase)
 		return // Abort in case of communication error
 	}
 
 	// Close database connection at the end, if still open
-	defer func() { _ = connDatabase.Close() }()
+	defer func() { _ = database.Close() }()
 
 	// Prepare database frontend to receive database messages
-	databaseReader := pgproto3.NewChunkReader(connDatabase)
-	databaseFrontend := pgproto3.NewFrontend(databaseReader, connDatabase)
+	databaseReader := pgproto3.NewChunkReader(database)
+	databaseFrontend := pgproto3.NewFrontend(databaseReader, database)
 
 	/////////////////////////////////////////////////
 	// Upgrade database connection to SSL, if desired
@@ -619,7 +728,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Decide whether to verify the encrypted connection
 		skipVerify := false
-		if utils.Contains([]string{"allow", "prefer", "require"}, listenerConfig.Database.SslMode) {
+		if scanUtils.StrContained(listenerConfig.Database.SslMode, []string{"allow", "prefer", "require"}) {
 			skipVerify = true
 		}
 
@@ -677,7 +786,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		} else if rDatabase[0] == 'S' {
 
 			// Execute SSL handshake
-			databaseTls := tls.Client(connDatabase, tlsDatabase)
+			databaseTls := tls.Client(database, tlsDatabase)
 			errDatabaseTls := databaseTls.Handshake()
 			if errDatabaseTls != nil {
 				_ = databaseTls.Close()
@@ -770,7 +879,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			clientErrMsg = ErrInternal
 
 			// Log error and return
-			logger.Errorf("Database startup failed: could not receive startup response: %s", errResponseStartup)
+			logger.Errorf("Database startup failed: could not receive startup response: %s.", errResponseStartup)
 			return
 		}
 
@@ -947,31 +1056,40 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	///////////////////////////////////////////////////////////////////////
 	// Cache connections for later lookups, e.g. to execute cancel requests
 	///////////////////////////////////////////////////////////////////////
+	logger.Debugf("Connection PID: %d.", keyData.ProcessID)
+	logger.Debugf("Connection SID: %d.", keyData.SecretKey)
 	logger.Infof("Caching connection details.")
 
 	// Cache key data and associated database connection if available
+	k := uuid // Chose random value if no key data is available
 	if keyData != nil {
-
-		// Get key
-		k := generateKey(keyData)
-
-		// Store connection under key
-		p.connectionMap.Set(k, PgConn{
-			Pid:        keyData.ProcessID,
-			Sid:        keyData.SecretKey,
-			User:       startupRaw.Parameters["user"],
-			Client:     startupRaw.Parameters["application_name"],
-			Connection: connDatabase,
-		})
-
-		// Make sure entry is cleaned from map after database connection is terminated
-		defer func() {
-			p.connectionMap.Remove(k)
-			p.logConnections()
-		}()
+		k = generateKey(keyData)
 	}
 
-	// Log currently fully established connections
+	// Prepare PgCon data for this connection
+	pgConn := PgConn{
+		Uuid:             uuid,
+		Pid:              keyData.ProcessID, // Might be 0 if no key data is available
+		Sid:              keyData.SecretKey, // Might be 0 if no key data is available
+		Db:               startupRaw.Parameters["database"],
+		User:             startupRaw.Parameters["user"],
+		Application:      startupRaw.Parameters["application_name"],
+		Timestamp:        time.Now(),
+		ConnectionDb:     database,
+		ConnectionClient: client,
+	}
+
+	// Store connection under key
+	p.connections.Set(k, &pgConn)
+
+	// Make sure entry is cleaned from map after database connection is terminated
+	defer func() {
+		logger.Debugf("Removing cached connection details.")
+		p.connections.Remove(k)
+	}()
+
+	// Print current connections
+	p.connectionsLogTicker.Reset(intervalConnectionsLog)
 	p.logConnections()
 
 	/////////////////////////////////////////////////////////////
@@ -987,18 +1105,30 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	wg := new(sync.WaitGroup)
 
 	// Prepare buffered channel for communication between query and response
-	type QueryData struct {
-		Raw       string
-		Queries   []string
-		Timestamp time.Time
+	type Statement struct {
+		Query      string
+		QueryInput string // Original query sent by client, which Query is extracted from
+		Start      time.Time
 	}
-	chQueryData := make(chan *QueryData, 1)
+
+	// Prepare slice to recorde the sequence of queries sent to the database.
+	// This slice can be used to map later database responses to their original query request.
+	var statementSequence []*Statement
+
+	// Disable client timeout, client might hold connection ready.
+	errDeadline = client.SetDeadline(time.Time{})
+	if errDeadline != nil {
+		p.logger.Errorf("Could not reset client deadline: %s.", errDeadline)
+	}
 
 	// Listen for client requests
 	go func() {
 
 		// Log termination
-		defer func() { logger.Debugf("Terminated client receiver.") }()
+		defer func() { logger.Debugf("Client receiver terminated.") }()
+
+		// Indicate end of communication to unblock parent goroutine
+		defer func() { chDone <- struct{}{} }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
@@ -1011,13 +1141,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if r := recover(); r != nil {
 				logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 			}
-
-			// Trigger end of communication and return
-			chDone <- struct{}{}
-			return
 		}()
 
-		// Loop and listen
+		// Prepare cache to lookup previously defined prepared statements (queries).
+		// In extended query flow the Bind message might reference previously defined queries.
+		var statementCache = make(map[string]string)
+
+		// Loop and listen for client requests
+		var queryBound string // The query currently referenced by the Bind command in extended query flow
 		for {
 
 			// Receive from client
@@ -1025,49 +1156,105 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errR != nil {
 
 				// Log error with respective criticality
+				var opError *net.OpError
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by client
-					logger.Debugf("Client terminated connection.")
+					logger.Debugf("Could not read from clinet, connection terminated.")
 				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
-					logger.Infof("Client connection terminated due to inactivity.")
-				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
-					// Connection closed by PgProxy
+					logger.Infof("Could not read from clinet, connection terminated due to inactivity.")
+				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Could not read from clinet, connection already closed.")
+				} else if errors.As(errR, &opError) {
+					logger.Debugf("Could not read from clinet, connection terminated: %s", opError)
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from client failed: %s", errR)
+					logger.Errorf("Proxying data from client failed: %s.", errR)
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end client receiver
 				return
-			}
-
-			// Update deadline for client to show activity
-			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
-			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s", errDeadlineUpdate)
 			}
 
 			// Forwarding query data to database receiver routine
 			if p.fnMonitoring != nil {
-				logger.Debugf("Request  Type '%T'.", r)
 
 				// Prepare data
 				switch q := r.(type) {
-				case *pgproto3.Query:
-					query := strings.Trim(q.String, " ")
-					chQueryData <- &QueryData{
-						Raw:       query,               // Original query string. Might be single query or sequence of queries.
-						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-						Timestamp: time.Now(),
+				case *pgproto3.Query: // Simple message flow, client asking to execute a query string, short version of Parse-Bind-Execute-Sync
+
+					// Split multi-query into single SQL statements.
+					// Single SQL statements are sanitized already.
+					queries := splitQueries(q.String)
+
+					// Log action
+					if len(queries) == 1 {
+						logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+					} else if len(queries) > 1 {
+						logger.Debugf("Request  Type '%T', adding %d queries to statement sequence.", r, len(queries))
 					}
-				case *pgproto3.Parse:
-					query := strings.Trim(q.Query, " ")
-					chQueryData <- &QueryData{
-						Raw:       query,               // Original query string. Might be single query or sequence of queries.
-						Queries:   splitQueries(query), // Sequence of single queries contained in original query string.
-						Timestamp: time.Now(),
+
+					// Add query to statement sequence
+					for _, query := range queries {
+						logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(query, "\n"), "\n    "))
+						logger.Debugf("Queueing bytes: %v", []byte(query))
+						statementSequence = append(statementSequence, &Statement{
+							Query:      query,
+							QueryInput: q.String,
+							Start:      time.Now(),
+						})
 					}
+
+					// Print raw string bytes for debuggability
+					logger.Debugf("Original bytes: %v", []byte(q.String))
+
+					// Switch connection state to active
+					if len(queries) > 0 {
+						pgConn.TimestampLast = time.Now()
+						pgConn.InProgress = true
+					}
+
+				case *pgproto3.Parse: // Client requesting to parse a prepared statement
+					logger.Debugf("Request  Type '%T', registering query.", r)
+
+					// Add query to prepared statement cache
+					statementCache[q.Name] = trimEmptySyntax(q.Query)
+
+				case *pgproto3.Bind: // Client requesting to load a previously parsed prepared statement
+					logger.Debugf("Request  Type '%T', loading query.", r)
+
+					// Retrieve associated query from statement cache
+					var okQueryBound bool
+					queryBound, okQueryBound = statementCache[q.PreparedStatement]
+					if !okQueryBound {
+						logger.Errorf("Reference '%s' not existing in statement cache.", q.PreparedStatement)
+					}
+
+				case *pgproto3.Execute: // Client requesting to execute the loaded statement
+					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+					logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(queryBound, "\n"), "\n    "))
+					logger.Debugf("Queueing bytes: %v", []byte(queryBound))
+
+					// Add query to statement sequence
+					statementSequence = append(statementSequence, &Statement{
+						Query:      queryBound,
+						QueryInput: queryBound,
+						Start:      time.Now(),
+					})
+
+					// Switch connection state to active
+					pgConn.TimestampLast = time.Now()
+					pgConn.InProgress = true
+
+				case *pgproto3.Terminate:
+					logger.Debugf("Request  Type '%T'.", r)
+
+					// Set termination indicator flag
+					pgConn.Terminated = true
+
 				default:
+					logger.Debugf("Request  Type '%T'.", r)
 				}
+
+				// Log branch completion, to see whether something got stuck
+				logger.Debugf("Request  Type '%T' done.", r)
 			}
 
 			// Forward to database
@@ -1075,7 +1262,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			if errSend != nil {
 
 				// Log error
-				logger.Errorf("Proxying data to database failed: %s", errSend)
+				logger.Errorf("Proxying data to database failed: %s.", errSend)
 
 				// Notify client about issue with backend database
 				notifyClient(&pgconn.PgError{
@@ -1083,8 +1270,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					Message: errSend.Error(),
 				})
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end client receiver
 				return
 			}
 
@@ -1101,36 +1287,52 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	go func() {
 
 		// Log termination
-		defer func() { logger.Infof("Terminated database receiver.") }()
+		defer func() { logger.Infof("Database receiver terminated.") }()
+
+		// Indicate end of communication to unblock parent goroutine
+		defer func() { chDone <- struct{}{} }()
 
 		// Increase wait group and make sure to decrease on termination
 		wg.Add(1)
 		defer wg.Done()
 
-		// Cache current query executed
-		var queryData *QueryData    // QueryData containing the query string currently worked on between the client and the database
-		var queryTime = time.Time{} // Timestamp when the query finished executing (before transmission of results)
-		var commands = 0            // Amount of SQL commands processed by the backend (A query may contain multiple SQL commands)
-		var rows = 0                // Amount of rows returned by an SQL command
+		// Prepare process variables
+		var statement = 0               // Current SQL statement pointer in a sequence of statements
+		var statementRows = 0           // Amount of rows returned by an SQL statement
+		var statementDone = time.Time{} // Timestamp when the statement finished executing (before transmission)
 
 		// Catch potential panics to gracefully log issue with stacktrace
 		defer func() {
-
-			// Log issue
 			if r := recover(); r != nil {
-				q := queryData.Raw
-				if commands < len(queryData.Queries) {
-					q = queryData.Queries[commands]
-				}
-				logger.Errorf(fmt.Sprintf("Panic: %s%s\n\tQuery:\n%s", r, scanUtils.StacktraceIndented("\t"), q))
+				logger.Errorf(fmt.Sprintf("Panic: %s%s", r, scanUtils.StacktraceIndented("\t")))
 			}
-
-			// Trigger end of communication and return
-			chDone <- struct{}{}
-			return
 		}()
 
-		// Loop and listen
+		// Check if there were remaining queries at the end and warn about for debugging purposes
+		defer func() {
+			if pgConn.Terminated {
+				// Termination requested, it's normal that one or more submitted queries might not get executed
+			} else if statement < len(statementSequence) {
+
+				// Extract queries from remaining statements
+				remainingQueries := make([]string, 0, len(statementSequence)-statement)
+				for _, remainingQuery := range statementSequence[statement:] {
+					remainingQueries = append(remainingQueries, remainingQuery.Query)
+				}
+
+				// Log remaining statements
+				// There should be zero left, amount of requests should exactly match amount of responses,
+				// otherwise, the monitoring function might point to wrong statement queries causing invalid logs!
+				logger.Errorf(
+					"Responses did not match requests and are off by %d (%d total):\n%s",
+					len(statementSequence)-statement,
+					len(statementSequence),
+					"    "+strings.Join(remainingQueries, ";\n    "),
+				)
+			}
+		}()
+
+		// Loop and listen for database responses
 		for {
 
 			// Receive from database
@@ -1139,11 +1341,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 				// Log error with respective criticality
 				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
-					logger.Infof("Database terminated connection: %s", errR)
-				} else if errors.As(errR, &net.ErrClosed) { // Connection closed by PgProxy
-					// Connection closed by PgProxy
+					logger.Infof("Database terminated connection: %s.", errR)
+				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Database connection already closed.")
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from server failed: %s", errR)
+					logger.Errorf("Proxying data from server failed: %s.", errR)
 
 					// Notify client about issue with backend database
 					notifyClient(&pgconn.PgError{
@@ -1152,170 +1354,192 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					})
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end database receiver
 				return
 			}
+			logger.Debugf("Received frontend message: %s", spew.Sdump(r))
 
-			// Execute command monitoring if activated
+			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
 
-				// Get query data (FrontendMessage), as communication segment has started
-				if queryData == nil {
-					select {
-					case queryData = <-chQueryData:
-					default: // Still working on the previous query
-					}
-				}
-
 				// Act on response depending on type
-				switch commandResp := r.(type) {
+				switch resp := r.(type) {
 				case *pgproto3.ErrorResponse:
 
-					// Check if amount of responses still matches expected amounts
-					var query string
-					if commands >= len(queryData.Queries) {
-
-						// Log secondary error
-						logger.Errorf(
-							"Received %d responses, while only %d were expected.",
-							commands+1,
-							len(queryData.Queries),
-						)
-
-						// Get query, prettify and unify for logging
-						_, query = prettify(logger, queryData.Raw)
-
-					} else { // Process response if it is as expected
-
-						// Get query, prettify and unify for logging
-						_, query = prettify(logger, queryData.Queries[commands])
+					// Get associated query
+					query := ""
+					queryInput := ""
+					if statement < len(statementSequence) {
+						query = statementSequence[statement].Query
+						queryInput = statementSequence[statement].QueryInput
+					} else if resp.Code == "57P01" { // admin_shutdown - Terminating connection due to administrator command
+						// Sent by the database without client trigger, so there might be no associated query.
+					} else if resp.Code == "08P01" { // protocol_violation - Client sent unexpected message
+						// Sent by the database after an invalid frontend message, so query might be missing or unknown
+						logger.Errorf("Client sent %s", resp.Message) // TODO debug, verify and remove log message
+					} else {
+						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
 					}
 
-					// Log error
-					logger.Infof(
-						"Response Type '%T': %s\n%s",
-						commandResp,
-						commandResp.Message,
+					// Try to prettify query if possible {
+					if resp.Code == "42601" { // Syntax error
+						// Fall back to the complete query input from the client
+						// The database is parsing the whole multi-query SQL string and checking its syntax
+						// before executing each of the contained queries. In case of a syntax error the
+						// database only returns once and the syntax error might not necessarily need to
+						// be contained in the first of the many queries.
+						query = queryInput
+					} else { // No syntax error
+						_, query = prettify(logger, query) // Try to prettify
+					}
+
+					// Log response type
+					logger.Debugf(
+						"Response Type '%T': %s\n%s\n%s",
+						resp,
+						resp.Message,
+						spew.Sdump(resp),
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 					)
 
-				case *pgproto3.EmptyQueryResponse:
+					// Skip subsequent already known queries, because they will be
+					// skipped by the database after this error
+					statement = len(statementSequence)
+
+				case *pgproto3.EmptyQueryResponse, *pgproto3.PortalSuspended: // Responses from empty query strings
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
-					logger.Debugf("Response Type '%T'.", commandResp)
+					logger.Debugf("Response Type '%T'.", resp)
+
+					// Release memory of statement, it's not needed anymore
+					// Do not reset whole statementSequence because subsequent queries might already be queued!
+					statementSequence[statement] = nil
+
+					// Increment statement pointer
+					statement++
+
+					// Reset statement's response row counter
+					statementRows = 0
+
+					// Reset query time for new timing
+					statementDone = time.Time{}
 
 				case *pgproto3.RowDescription:
 
-					// Postgres returns one RowDescription response per command result
-					logger.Debugf("Response Type '%T'.", commandResp)
-					queryTime = time.Now()
+					// Postgres returns one RowDescription response per statement result
+					logger.Debugf("Response Type '%T'.", resp)
+					statementDone = time.Now()
 
 				case *pgproto3.DataRow:
 
 					// Postgres returns one DataRow response per result ROW!
 					// Don't log, because it would bloat the log file.
-					rows++
+					statementRows++
 
 				case *pgproto3.CommandComplete:
 
 					// Make up for skipped DataRow response logs with aggregated DataRow log entry
-					if rows > 0 {
-						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, rows)
+					if statementRows > 0 {
+						logger.Debugf("Response Type '%T' (%dx).", &pgproto3.DataRow{}, statementRows)
 					}
 
-					// Check if amount of responses still matches expected amounts
-					if commands >= len(queryData.Queries) {
+					// Log action
+					logger.Infof("Response Type '%T', logging statement.", resp)
 
-						// Get query, prettify and unify for logging
-						_, query := prettify(logger, queryData.Raw)
+					// Get associated query data
+					queryData := statementSequence[statement]
 
-						// Log error
-						logger.Errorf(
-							"Received %d responses, while only %d were expected in this multi query:\n%s",
-							commands+1,
-							len(queryData.Queries),
-							query,
-						)
-					} else { // Process response if it is as expected
+					// Get query, prettify and unify for logging
+					tables, query := prettify(logger, queryData.Query)
 
-						// Log action
-						logger.Infof("Response Type '%T', logging command.", commandResp)
+					// Extract row count
+					queryRows := parseRows(logger, resp.CommandTag)
 
-						// Get query, prettify and unify for logging
-						tables, query := prettify(logger, queryData.Queries[commands])
-
-						// Extract row count
-						queryRows := parseRows(logger, commandResp.CommandTag)
-
-						// Log command execution
-						tEnd := time.Now()
-						tExec := tEnd
-						if !queryTime.IsZero() {
-							tExec = queryTime
-						}
-						errMonitoring := p.fnMonitoring(
-							startupRaw.Parameters["database"],
-							startupRaw.Parameters["user"],
-							tables,
-							query,
-							queryRows,
-							queryData.Timestamp,
-							tExec,
-							tEnd,
-							startupRaw.Parameters["application_name"],
-						)
-						if errMonitoring != nil {
-							logger.Errorf("Could not monitor query: %s.", errMonitoring)
-						}
+					// Log statement execution
+					tEnd := time.Now()
+					tExec := tEnd
+					if !statementDone.IsZero() {
+						tExec = statementDone
+					}
+					errMonitoring := p.fnMonitoring(
+						logger,
+						startupRaw.Parameters["database"],
+						startupRaw.Parameters["user"],
+						tables,
+						query,
+						queryRows,
+						queryData.Start,
+						tExec,
+						tEnd,
+						startupRaw.Parameters["application_name"],
+					)
+					if errMonitoring != nil {
+						logger.Errorf("Could not monitor query: %s.", errMonitoring)
 					}
 
-					// Reset command's response row counter
-					rows = 0
+					// Release memory of statement, it's not needed anymore
+					// Do not reset whole statementSequence because subsequent queries might already be queued!
+					statementSequence[statement] = nil
 
-					// Increment command counter
-					commands++
+					// Increment statement pointer
+					statement++
+
+					// Reset statement's response row counter
+					statementRows = 0
 
 					// Reset query time for new timing
-					queryTime = time.Time{}
+					statementDone = time.Time{}
 
 				case *pgproto3.ParameterStatus: //  Informs the frontend about the current (initial) setting of a backend parameter
 
-					// Might be sent by the backend automatically AFTER CommandComplete (e.g. if notification of client after SET command is intended)
-					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", commandResp, commandResp.Name, commandResp.Value)
+					// Might be sent by the backend automatically AFTER CommandComplete
+					// (e.g. if notification of client after SET statement is intended)
+					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", resp, resp.Name, resp.Value)
+
+					// Update application name in startup data and active connections
+					if resp.Name == "application_name" && resp.Value != "" {
+
+						// Update application name in startup parameters
+						startupRaw.Parameters["application_name"] = resp.Value
+
+						// Switch connection state to passive
+						pgConn.Application = resp.Value
+					}
 
 				case *pgproto3.ReadyForQuery:
 
-					// Reset query data (FrontendMessage), as communication segment has come to an end
-					logger.Debugf("Response Type '%T', resetting query data.", commandResp)
-					queryData = nil
-					commands = 0
+					// Log action
+					logger.Debugf("Response Type '%T'.", resp)
+
+					// Switch connection state to passive
+					pgConn.InProgress = false
 
 				default:
-					logger.Debugf("Response Type '%T'.", commandResp)
+					logger.Debugf("Response Type '%T'.", resp)
 				}
 			}
 
 			// Forward to client
+			logger.Debugf("Forwarding frontend message.")
 			errSend := clientBackend.Send(r)
 			if errSend != nil {
 
 				// Log error with respective criticality
-				if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
-					logger.Infof("Client connection terminated due to inactivity.")
+				var opError *net.OpError
+				if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
+					logger.Debugf("Could not send to client, connection terminated.")
+				} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
+					logger.Infof("Could not send to client, connection terminated due to inactivity.")
+				} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
+					logger.Debugf("Could not send to client, connection already closed.")
+				} else if errors.As(errSend, &opError) {
+					logger.Debugf("Could not send to client, connection terminated: %s", opError)
 				} else { // Unexpected error
-					logger.Errorf("Proxying data to client failed: %s", errSend)
+					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
 
-				// Indicate end of communication and return
-				chDone <- struct{}{}
+				// Return and end database receiver
 				return
-			}
-
-			// Update deadline for client to show activity
-			errDeadlineUpdate := client.SetDeadline(time.Now().Add(p.listenerTimeout))
-			if errDeadlineUpdate != nil {
-				logger.Errorf("Updating client deadline failed: %s", errDeadlineUpdate)
 			}
 
 			// Exit goroutine if necessary
@@ -1333,7 +1557,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			select {
 			case <-p.ctx.Done():
 				return
-
 			case _ = <-chDone:
 				return
 			}
@@ -1341,11 +1564,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}()
 
 	// Log waiting
-	logger.Debugf("Waiting for remaining goroutines.")
+	logger.Debugf("Waiting for remaining receiver.")
 
 	// Close client and database connections to resolve potentially blocking Receive() calls in goroutines
-	_ = connDatabase.Close()
+	_ = database.Close()
 	_ = client.Close()
+
+	// Read remaining done signal to unblock remaining receiver goroutine. There are always two,
+	// one listening for client communication and one listening for database communication.
+	<-chDone
 
 	// Wait for all goroutines
 	wg.Wait()
@@ -1354,21 +1581,62 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 // logConnections prints currently active connections utilizing the logger
 func (p *PgReverseProxy) logConnections() {
 	msg := "Active database connections:"
-	if p.connectionMap.Count() > 0 {
-		for _, v := range p.connectionMap.Items() {
+	if p.connections.Count() > 0 {
+
+		// Get current map items as slice
+		clientConnections := make([]*PgConn, 0, p.connections.Count())
+		for _, v := range p.connections.Items() {
+			clientConnections = append(clientConnections, v)
+		}
+
+		// Sort slice
+		slices.SortFunc(clientConnections, func(a, b *PgConn) int {
+			if a.Db == b.Db {
+				return cmp.Compare(a.User, b.User)
+			}
+			return cmp.Compare(a.Db, b.Db)
+		})
+
+		// Build log message
+		for _, clientConnection := range clientConnections {
+			user := clientConnection.User
+			if len(user) > 20 {
+				user = user[:17] + "..."
+			}
+			client := clientConnection.Application
+			if len(client) > 25 {
+				client = client[:22] + "..."
+			}
+			last := clientConnection.Timestamp
+			if !clientConnection.TimestampLast.IsZero() {
+				last = clientConnection.TimestampLast
+			}
+			state := "Pssv"
+			if clientConnection.InProgress {
+				state = "Actv"
+			}
+			addr := clientConnection.ConnectionClient.RemoteAddr().String()
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				addr = host
+			}
 			msg += fmt.Sprintf(
-				"\n    Pid: %-5d | Sid: %-10d | Origin: %-21s | Client: '%s' \t| User: %s",
-				v.Pid,
-				v.Sid,
-				v.Connection.RemoteAddr(),
-				v.Client,
-				v.User,
+				"\n    [%s] | Last: %-19s (%s) | Db: %-10s | Usr: %-20s | Client: '%-25s' | Src: %-15s",
+				clientConnection.Uuid,
+				last.Format("2006-01-02 15:04:05"),
+				state,
+				clientConnection.Db,
+				user,
+				client,
+				addr,
 			)
 		}
-		p.log.Debugf(msg)
+
+		// Log message
+		p.logger.Debugf(msg)
 	} else {
-		msg += fmt.Sprintf("\n\t-")
-		p.log.Debugf(msg)
+		msg += fmt.Sprintf(" %d", p.wgCount.Value())
+		p.logger.Debugf(msg)
 	}
 }
 
@@ -1439,29 +1707,87 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	}
 }
 
-// splitQueries checks whether a query consists out of multiple single queries to be executed by the database
-// and returns a slice of single queries.
+// splitQueries checks whether a query consists out of multiple single queries, indicated by a semicolon,
+// to be executed by the database. Returns a slice of queries. Queries are sanitized by empty leading or trailing
+// symbols. Empty queries are removed. If there is no useful query content at all, an empty slice is returned
 func splitQueries(sql string) []string {
 
-	// Split queries by unquoted semicolon
+	// Cleanup empty characters from both ends
+	sql = trimEmptySyntax(sql)
+
+	// Define parse states
+	const ( // iota is reset to 0
+		CommentNone             = 0
+		CommentMaybe            = iota
+		CommentLine             = iota
+		CommentMultiline        = iota
+		CommentMultilineClosing = iota
+	)
+
+	// Prepare memory for field func states
+	commentState := CommentNone
 	quotedSingle := false
 	quotedDouble := false
+
+	// Split queries by semicolon if it does not occure within single quotes, double quotes or any kind of comment
 	queries := strings.FieldsFunc(sql, func(r rune) bool {
-		if r == '"' && !quotedSingle {
-			quotedDouble = !quotedDouble
+
+		// Manage opening/closing of line comment
+		if commentState == CommentNone {
+			if r == '/' || r == '-' {
+				commentState = CommentMaybe
+			}
+		} else if commentState == CommentMaybe {
+			if r == '/' || r == '-' {
+				commentState = CommentLine
+			} else if r == '*' {
+				commentState = CommentMultiline
+			} else if r != '/' {
+				commentState = CommentNone
+			}
+		} else if commentState == CommentLine {
+			if r == '\n' {
+				commentState = CommentNone
+			}
+		} else if commentState == CommentMultiline {
+			if r == '*' {
+				commentState = CommentMultilineClosing
+			}
+		} else if commentState == CommentMultilineClosing {
+			if r == '/' {
+				commentState = CommentNone
+			} else if r != '*' {
+				commentState = CommentMultiline // Fall back, multi line comment is not yet closing
+			}
 		}
-		if r == '\'' && !quotedDouble {
-			quotedSingle = !quotedSingle
+
+		// If not commented, check if quoted string starts
+		if commentState <= CommentMaybe {
+
+			// Manage opening/closing of double quote strings
+			if r == '"' && !quotedSingle {
+				quotedDouble = !quotedDouble
+			}
+
+			// Manage opening/closing of single quote strings
+			if r == '\'' && !quotedDouble {
+				quotedSingle = !quotedSingle
+			}
 		}
-		return !quotedSingle && !quotedDouble && r == ';'
+
+		// Return true if character unquoted and uncommented semicolon
+		return r == ';' &&
+			!quotedSingle &&
+			!quotedDouble &&
+			commentState != CommentLine &&
+			commentState != CommentMultiline
 	})
 
-	// Filter empty
+	// Sanitize split queries and remove empty ones
 	queriesSanitized := make([]string, 0, len(queries))
 	for _, query := range queries {
-		query = strings.Trim(query, " ")
-		query = strings.Trim(query, "\n")
-		if strings.ReplaceAll(strings.ReplaceAll(query, "\n", ""), " ", "") != "" {
+		query = trimEmptySyntax(query)
+		if len(query) > 0 {
 			queriesSanitized = append(queriesSanitized, query)
 		}
 	}
@@ -1477,6 +1803,12 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	// Unify spacings in the query
 	query = strings.ReplaceAll(query, "    ", "  ") // Replace quad spaces with double spaces
 	query = strings.ReplaceAll(query, "\t", "  ")   // Replace tabulators with double spaces
+	query = trimEmptySyntax(query)
+
+	// Return empty results if string is empty
+	if len(query) == 0 {
+		return
+	}
 
 	// Check if query contains some indentation already
 	indentation := -1
@@ -1510,15 +1842,19 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		query = strings.Join(lines, "\n")
 	}
 
+	// Prepare warn flag to avoid duplicate reporting
+	warned := false
+
 	// Tokenize query
 	tokens, errTokenizer := lexer.Tokenize(query)
 	if errTokenizer != nil {
+		warned = true
 		logger.Warningf(
-			"Could not tokenize query: '%s'\n%s",
+			"Could not tokenize query: %s:\n%s",
 			errTokenizer,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
-		return
+		// Warn about issue, but continue
 	}
 
 	// Search token tree for FROM tables names
@@ -1529,13 +1865,14 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 
 	// Parse query clauses from tokens
 	tokensParsed, errParse := parser.Parse(tokens, options)
-	if errParse != nil {
+	if errParse != nil && !warned {
+		warned = true
 		logger.Warningf(
-			"Could not parse query: '%s'\n%s",
+			"Could not parse query: %s:\n%s",
 			errParse,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
-		return
+		// Warn about issue, but continue
 	}
 
 	// Format parsed tokens into buffer
@@ -1548,19 +1885,34 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		}
 	}
 
+	// Log formatting issue
+	if errFormat != nil && !warned {
+		warned = true
+		logger.Warningf(
+			"Could not format query: %s:\n%s",
+			errFormat,
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+		)
+		// Warn about issue, but continue
+	}
+
 	// Get formatted sql string
 	sql = sqlBuf.String()
 
 	// Compare if formatted query still has the same logic as input
 	valid := sqlfmt.CompareSemantic(query, sql)
+	if !valid && !warned {
+		warned = true
+		logger.Warningf(
+			"Could not prettify query, output diverges:\n%s\n    |!=--->\n%s",
+			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+			"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
+		)
+		// Warn about issue, but continue
+	}
 
 	// Reset formatted SQL string to original input if there was an error
-	if !valid || errFormat != nil {
-		logger.Warningf(
-			"Could not format query: '%s'\n%s",
-			errFormat,
-			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-		)
+	if !valid || errFormat != nil || errParse != nil || errTokenizer != nil {
 		sql = query
 	}
 
@@ -1568,11 +1920,7 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	sql = strings.ReplaceAll(sql, "\n\n", "\n") // Remove empty lines
 
 	// Remove empty spaces and linebreaks
-	for strings.HasPrefix(sql, "\n") || strings.HasSuffix(sql, "\n") ||
-		strings.HasPrefix(sql, " ") || strings.HasSuffix(sql, " ") {
-		sql = strings.Trim(sql, "\n") // Remove leading and trailing linebreaks
-		sql = strings.Trim(sql, " ")  // Remove leading and trailing spaces
-	}
+	sql = trimEmptySyntax(sql) // Remove leading and trailing spaces and linebreaks
 
 	// Return with what was found as tables
 	// Empty if neither tokenizer nor manual search could match
@@ -1582,6 +1930,9 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 // parseRows extracts the number of affected rows from a response's command tag
 func parseRows(logger scanUtils.Logger, tag []byte) int {
 	queryTag := string(tag)
+	if strings.ToUpper(queryTag) == "DISCARD ALL" {
+		return 0
+	}
 	queryTagFragments := strings.SplitN(queryTag, " ", -1)
 	queryRowsFragment := ""
 	if len(queryTagFragments) == 1 {
@@ -1610,7 +1961,7 @@ func findTableNames(tokens []lexer.Token) []string {
 		if token.Type == lexer.FROM { // Mark found to indicate next value is table name
 			found = true
 		} else if found && token.Type == lexer.IDENT {
-			if !utils.Contains(tables, token.Value) {
+			if !scanUtils.StrContained(token.Value, tables) {
 				tables = append(tables, token.Value)
 			}
 			found = false // Reset after associated IDENT was found
