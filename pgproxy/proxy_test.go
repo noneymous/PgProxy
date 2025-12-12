@@ -1,9 +1,10 @@
 package pgproxy
 
 import (
-	"github.com/davecgh/go-spew/spew"
 	"reflect"
 	"testing"
+
+	"github.com/davecgh/go-spew/spew"
 )
 
 func Test_splitQueries(t *testing.T) {

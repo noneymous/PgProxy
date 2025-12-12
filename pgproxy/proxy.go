@@ -10,6 +10,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
 	"github.com/davecgh/go-spew/spew"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgproto3/v2"
@@ -20,15 +30,6 @@ import (
 	"github.com/noneymous/go-sqlfmt/sqlfmt/parser"
 	cmap "github.com/orcaman/concurrent-map/v2"
 	scanUtils "github.com/siemens/GoScans/utils"
-	"io"
-	"net"
-	"os"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
 )
 
 const intervalConnectionsLog = time.Second * 60

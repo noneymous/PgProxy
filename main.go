@@ -4,12 +4,12 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	scanUtils "github.com/siemens/GoScans/utils"
 	"log"
 	"strings"
 	"time"
 
 	"github.com/noneymous/PgProxy/pgproxy"
+	scanUtils "github.com/siemens/GoScans/utils"
 )
 
 // Example SNI configuration with a single SNI and target database
