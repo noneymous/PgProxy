@@ -5,9 +5,10 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"gorm.io/gorm/utils"
 	"os"
 	"strings"
+
+	"gorm.io/gorm/utils"
 )
 
 // SslModes defines valid settings for establishing encrypted database connections

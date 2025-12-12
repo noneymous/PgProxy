@@ -3,10 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/noneymous/PgProxy/pgproxy"
 	"log"
 	"strings"
 	"time"
+
+	"github.com/noneymous/PgProxy/pgproxy"
 )
 
 // Example SNI configuration with a single SNI and target database
@@ -81,7 +82,11 @@ func main() {
 	// Load certificates from paths into memory
 	for i, sni := range snis {
 		jsn, _ := json.Marshal(sni)
-		_ = snis[i].UnmarshalJSON(jsn)
+		errUnmarshal := snis[i].UnmarshalJSON(jsn)
+		if errUnmarshal != nil {
+			logger.Errorf("Could not load SNI certificate: %s.", errUnmarshal)
+			return
+		}
 	}
 
 	// Register proxy interfaces and routes
