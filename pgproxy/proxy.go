@@ -518,6 +518,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				}
 			}
 
+			// Set terminated flag for processing goroutine to know
+			pgConn.Terminated = true
+
 			// Log success and abort further communication
 			logger.Infof("Cancel request successful.")
 			return
@@ -1057,9 +1060,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	///////////////////////////////////////////////////////////////////////
 	// Cache connections for later lookups, e.g. to execute cancel requests
 	///////////////////////////////////////////////////////////////////////
-	logger.Debugf("Connection PID: %d.", keyData.ProcessID)
-	logger.Debugf("Connection SID: %d.", keyData.SecretKey)
-	logger.Infof("Caching connection details.")
+	logger.Infof("Connection '%d-%d' (PID-SID).", keyData.ProcessID, keyData.SecretKey)
+	logger.Debugf("Caching connection details.")
 
 	// Cache key data and associated database connection if available
 	k := uuid // Chose random value if no key data is available
@@ -1312,7 +1314,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Check if there were remaining queries at the end and warn about for debugging purposes
 		defer func() {
 			if pgConn.Terminated {
-				// Termination requested, it's normal that one or more submitted queries might not get executed
+				// Termination requested, it's normal that one or more submitted queries might not get executed anymore
 			} else if statement < len(statementSequence) {
 
 				// Extract queries from remaining statements
