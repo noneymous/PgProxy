@@ -51,18 +51,18 @@ func (e *ErrCertificate) Error() string {
 }
 
 type PgConn struct {
-	Uuid             string // random string identifying log messages of this connection stream
-	Pid              uint32
-	Sid              uint32
-	Db               string
-	User             string
-	Application      string
-	Timestamp        time.Time
-	TimestampLast    time.Time
-	ConnectionDb     net.Conn
-	ConnectionClient net.Conn
-	InProgress       bool // Flag whether a query is currently in execution
-	Terminated       bool // Flag whether Termination was requested by client
+	Uuid            string // random string identifying log messages of this connection stream
+	Pid             uint32
+	Sid             uint32
+	Db              string
+	User            string
+	Application     string
+	Timestamp       time.Time
+	TimestampLast   time.Time
+	AddressDatabase string
+	AddressClient   string
+	InProgress      bool // Flag whether a query is currently in execution
+	Terminated      bool // Flag whether Termination was requested by client
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
@@ -479,11 +479,28 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Get connection to cancel by key
 			pgConn, okPgConn := p.connections.Get(k)
 			if !okPgConn {
-				logger.Infof("Cancel request for unknown connection '%T'.", keyData)
-				return // Abort in case of communication error
-			} else {
-				logger.Infof("Cancel request for connection '%s'.", k)
+				logger.Warningf(
+					"Cancel request from '%s' for unknown connection '%T'.",
+					client.RemoteAddr().String(),
+					keyData,
+				)
+				return // Abort in case of unknown connection ID. Without, we can't know which DB server to dispatch to.
 			}
+
+			// Log cancel request
+			logger.Infof("Cancel request from '%s' for connection '%s'.", client.RemoteAddr().String(), k)
+
+			// A new connection is required, because Postgres might close this one after processing the cancel request
+			databaseCancel, errDatabaseCancel := net.Dial("tcp", pgConn.AddressDatabase)
+			if errDatabaseCancel != nil {
+				logger.Errorf(
+					"Cancel request from '%s' for connection '%s' failed: %s",
+					client.RemoteAddr().String(),
+					k,
+					errDatabaseCancel,
+				)
+			}
+			defer func() { _ = databaseCancel.Close() }()
 
 			// Prepare cancel data
 			buf := make([]byte, 16)
@@ -493,36 +510,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			binary.BigEndian.PutUint32(buf[12:16], m.SecretKey)
 
 			// Send cancel request on connection
-			_, errWrite := pgConn.ConnectionDb.Write(buf)
+			_, errWrite := databaseCancel.Write(buf)
 			if errWrite != nil {
-				var opError *net.OpError
-				if errors.As(errWrite, &opError) {
-					// Ignore operational errors
-				} else {
-					logger.Errorf("Cancel request failed: %s.", errWrite)
-					return // Abort in case of communication error
-				}
-			}
-
-			// Read cancel response from connection
-			_, errRead := pgConn.ConnectionDb.Read(buf)
-			if errRead != nil {
-				var opError *net.OpError
-				if errors.Is(errRead, io.EOF) {
-					// Ignore read error
-				} else if errors.As(errRead, &opError) {
-					// Ignore operational errors
-				} else {
-					logger.Errorf("Cancel response failed: %s.", errRead)
-					return // Abort in case of communication error
-				}
+				logger.Errorf(
+					"Cancel request from '%s' for connection '%s' failed: %s",
+					client.RemoteAddr().String(),
+					k,
+					errWrite,
+				)
+				return // Abort in case of communication error
 			}
 
 			// Set terminated flag for processing goroutine to know
 			pgConn.Terminated = true
 
 			// Log success and abort further communication
-			logger.Infof("Cancel request successful.")
+			logger.Debugf("Cancel request successful.")
 			return
 
 		case *pgproto3.SSLRequest:
@@ -1071,15 +1074,15 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Prepare PgCon data for this connection
 	pgConn := PgConn{
-		Uuid:             uuid,
-		Pid:              keyData.ProcessID, // Might be 0 if no key data is available
-		Sid:              keyData.SecretKey, // Might be 0 if no key data is available
-		Db:               startupRaw.Parameters["database"],
-		User:             startupRaw.Parameters["user"],
-		Application:      startupRaw.Parameters["application_name"],
-		Timestamp:        time.Now(),
-		ConnectionDb:     database,
-		ConnectionClient: client,
+		Uuid:            uuid,
+		Pid:             keyData.ProcessID, // Might be 0 if no key data is available
+		Sid:             keyData.SecretKey, // Might be 0 if no key data is available
+		Db:              startupRaw.Parameters["database"],
+		User:            startupRaw.Parameters["user"],
+		Application:     startupRaw.Parameters["application_name"],
+		Timestamp:       time.Now(),
+		AddressDatabase: address,
+		AddressClient:   client.RemoteAddr().String(),
 	}
 
 	// Store connection under key
@@ -1155,32 +1158,33 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		for {
 
 			// Receive from client
-			r, errR := clientBackend.Receive()
-			if errR != nil {
+			msgFrontend, errMsgFrontend := clientBackend.Receive()
+			if errMsgFrontend != nil {
 
 				// Log error with respective criticality
 				var opError *net.OpError
-				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by client
+				if errors.Is(errMsgFrontend, io.ErrUnexpectedEOF) { // Connection closed by client
 					logger.Debugf("Could not read from clinet, connection terminated.")
-				} else if errors.Is(errR, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
+				} else if errors.Is(errMsgFrontend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Could not read from clinet, connection terminated due to inactivity.")
-				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+				} else if errors.Is(errMsgFrontend, net.ErrClosed) { // Connection already closed by PgProxy
 					logger.Debugf("Could not read from clinet, connection already closed.")
-				} else if errors.As(errR, &opError) {
+				} else if errors.As(errMsgFrontend, &opError) {
 					logger.Debugf("Could not read from clinet, connection terminated: %s", opError)
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from client failed: %s.", errR)
+					logger.Errorf("Proxying data from client failed: %s.", errMsgFrontend)
 				}
 
 				// Return and end client receiver
 				return
 			}
+			logger.Debugf("Received frontend message (client request): %s", spew.Sdump(msgFrontend))
 
 			// Forwarding query data to database receiver routine
 			if p.fnMonitoring != nil {
 
 				// Prepare data
-				switch q := r.(type) {
+				switch q := msgFrontend.(type) {
 				case *pgproto3.Query: // Simple message flow, client asking to execute a query string, short version of Parse-Bind-Execute-Sync
 
 					// Split multi-query into single SQL statements.
@@ -1189,9 +1193,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Log action
 					if len(queries) == 1 {
-						logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+						logger.Debugf("Request  Type '%T', adding query to statement sequence.", msgFrontend)
 					} else if len(queries) > 1 {
-						logger.Debugf("Request  Type '%T', adding %d queries to statement sequence.", r, len(queries))
+						logger.Debugf("Request  Type '%T', adding %d queries to statement sequence.", msgFrontend, len(queries))
 					}
 
 					// Add query to statement sequence
@@ -1215,13 +1219,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					}
 
 				case *pgproto3.Parse: // Client requesting to parse a prepared statement
-					logger.Debugf("Request  Type '%T', registering query.", r)
+					logger.Debugf("Request  Type '%T', registering query.", msgFrontend)
 
 					// Add query to prepared statement cache
 					statementCache[q.Name] = trimEmptySyntax(q.Query)
 
 				case *pgproto3.Bind: // Client requesting to load a previously parsed prepared statement
-					logger.Debugf("Request  Type '%T', loading query.", r)
+					logger.Debugf("Request  Type '%T', loading query.", msgFrontend)
 
 					// Retrieve associated query from statement cache
 					var okQueryBound bool
@@ -1231,7 +1235,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					}
 
 				case *pgproto3.Execute: // Client requesting to execute the loaded statement
-					logger.Debugf("Request  Type '%T', adding query to statement sequence.", r)
+					logger.Debugf("Request  Type '%T', adding query to statement sequence.", msgFrontend)
 					logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(queryBound, "\n"), "\n    "))
 					logger.Debugf("Queueing bytes: %v", []byte(queryBound))
 
@@ -1247,21 +1251,22 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					pgConn.InProgress = true
 
 				case *pgproto3.Terminate:
-					logger.Debugf("Request  Type '%T'.", r)
+					logger.Debugf("Request  Type '%T'.", msgFrontend)
 
 					// Set termination indicator flag
 					pgConn.Terminated = true
 
 				default:
-					logger.Debugf("Request  Type '%T'.", r)
+					logger.Debugf("Request  Type '%T'.", msgFrontend)
 				}
 
 				// Log branch completion, to see whether something got stuck
-				logger.Debugf("Request  Type '%T' done.", r)
+				logger.Debugf("Request  Type '%T' done.", msgFrontend)
 			}
 
 			// Forward to database
-			errSend := databaseFrontend.Send(r)
+			logger.Debugf("Forwarding frontend message.")
+			errSend := databaseFrontend.Send(msgFrontend)
 			if errSend != nil {
 
 				// Log error
@@ -1339,34 +1344,34 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		for {
 
 			// Receive from database
-			r, errR := databaseFrontend.Receive()
-			if errR != nil {
+			msgBackend, errMsgBackend := databaseFrontend.Receive()
+			if errMsgBackend != nil {
 
 				// Log error with respective criticality
-				if errors.Is(errR, io.ErrUnexpectedEOF) { // Connection closed by database
-					logger.Infof("Database terminated connection: %s.", errR)
-				} else if errors.Is(errR, net.ErrClosed) { // Connection already closed by PgProxy
+				if errors.Is(errMsgBackend, io.ErrUnexpectedEOF) { // Connection closed by database
+					logger.Infof("Database terminated connection: %s.", errMsgBackend)
+				} else if errors.Is(errMsgBackend, net.ErrClosed) { // Connection already closed by PgProxy
 					logger.Debugf("Database connection already closed.")
 				} else { // Unexpected error
-					logger.Errorf("Proxying data from server failed: %s.", errR)
+					logger.Errorf("Proxying data from server failed: %s.", errMsgBackend)
 
 					// Notify client about issue with backend database
 					notifyClient(&pgconn.PgError{
 						Code:    "FATAL",
-						Message: errR.Error(),
+						Message: errMsgBackend.Error(),
 					})
 				}
 
 				// Return and end database receiver
 				return
 			}
-			logger.Debugf("Received frontend message: %s", spew.Sdump(r))
+			logger.Debugf("Received backend message (database response): %s", spew.Sdump(msgBackend))
 
 			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
 
 				// Act on response depending on type
-				switch resp := r.(type) {
+				switch resp := msgBackend.(type) {
 				case *pgproto3.ErrorResponse:
 
 					// Get associated query
@@ -1379,7 +1384,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						// Sent by the database without client trigger, so there might be no associated query.
 					} else if resp.Code == "08P01" { // protocol_violation - Client sent unexpected message
 						// Sent by the database after an invalid frontend message, so query might be missing or unknown
-						logger.Errorf("Client sent %s", resp.Message) // TODO debug, verify and remove log message
+						logger.Errorf("Database sent %s", resp.Message) // TODO debug, verify and remove log message
 					} else {
 						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
 					}
@@ -1523,8 +1528,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Forward to client
-			logger.Debugf("Forwarding frontend message.")
-			errSend := clientBackend.Send(r)
+			logger.Debugf("Forwarding backend message.")
+			errSend := clientBackend.Send(msgBackend)
 			if errSend != nil {
 
 				// Log error with respective criticality
@@ -1618,7 +1623,7 @@ func (p *PgReverseProxy) logConnections() {
 			if clientConnection.InProgress {
 				state = "Actv"
 			}
-			addr := clientConnection.ConnectionClient.RemoteAddr().String()
+			addr := clientConnection.AddressClient
 			host, _, err := net.SplitHostPort(addr)
 			if err == nil {
 				addr = host
