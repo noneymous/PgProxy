@@ -1164,13 +1164,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Log error with respective criticality
 				var opError *net.OpError
 				if errors.Is(errMsgFrontend, io.ErrUnexpectedEOF) { // Connection closed by client
-					logger.Debugf("Could not read from clinet, connection terminated.")
+					logger.Debugf("Could not read from client, connection terminated.")
+					pgConn.Terminated = true
 				} else if errors.Is(errMsgFrontend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
-					logger.Infof("Could not read from clinet, connection terminated due to inactivity.")
+					logger.Infof("Could not read from client, connection terminated due to inactivity.")
+					pgConn.Terminated = true
 				} else if errors.Is(errMsgFrontend, net.ErrClosed) { // Connection already closed by PgProxy
-					logger.Debugf("Could not read from clinet, connection already closed.")
+					logger.Debugf("Could not read from client, connection already closed.")
+					pgConn.Terminated = true
 				} else if errors.As(errMsgFrontend, &opError) {
-					logger.Debugf("Could not read from clinet, connection terminated: %s", opError)
+					logger.Debugf("Could not read from client, connection terminated: %s", opError)
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from client failed: %s.", errMsgFrontend)
 				}
@@ -1253,9 +1256,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				case *pgproto3.Terminate:
 					logger.Debugf("Request  Type '%T'.", msgFrontend)
 
-					// Set termination indicator flag
-					pgConn.Terminated = true
-
 				default:
 					logger.Debugf("Request  Type '%T'.", msgFrontend)
 				}
@@ -1319,7 +1319,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Check if there were remaining queries at the end and warn about for debugging purposes
 		defer func() {
 			if pgConn.Terminated {
-				// Termination requested, it's normal that one or more submitted queries might not get executed anymore
+				// Termination requested or client disconnected, remaining queued queries might not get executed anymore
 			} else if statement < len(statementSequence) {
 
 				// Extract queries from remaining statements
@@ -1461,7 +1461,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					tables, query := prettify(logger, queryData.Query)
 
 					// Extract row count
-					queryRows := parseRows(logger, resp.CommandTag)
+					queryRows := rowsAffected(resp.CommandTag)
 
 					// Log statement execution
 					tEnd := time.Now()
@@ -1935,30 +1935,31 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 	return tables, sql
 }
 
-// parseRows extracts the number of affected rows from a response's command tag
-func parseRows(logger scanUtils.Logger, tag []byte) int {
+// rowsAffected extracts the number of affected rows from a response's command tag
+func rowsAffected(tag []byte) int {
+
+	// Convert to string
 	queryTag := string(tag)
-	if strings.ToUpper(queryTag) == "DISCARD ALL" {
+
+	// Split fields
+	fields := strings.Fields(queryTag)
+	if len(fields) == 0 {
 		return 0
 	}
-	queryTagFragments := strings.SplitN(queryTag, " ", -1)
-	queryRowsFragment := ""
-	if len(queryTagFragments) == 1 {
-		return 0
-	} else if len(queryTagFragments) == 2 {
-		queryRowsFragment = queryTagFragments[1]
-	} else if len(queryTagFragments) == 3 {
-		queryRowsFragment = queryTagFragments[2]
-	} else {
-		logger.Errorf("Unexpected command tag '%s'.", queryTag)
-		return 0
-	}
-	rows, errRows := strconv.Atoi(queryRowsFragment)
-	if errRows != nil {
-		logger.Errorf("Unexpected command tag rows count '%s'.", queryTag)
+
+	// Take last item.
+	// If the tag ends with an integer, that integer is the rows-affected count.
+	// Otherwise, there is no row count.
+	last := fields[len(fields)-1]
+
+	// Try to parse value as integer
+	n, err := strconv.ParseInt(last, 10, 64)
+	if err != nil {
 		return 0
 	}
-	return rows
+
+	// Return integer as rows count
+	return int(n)
 }
 
 // findTableNames iterates over the elements to search for FROM token types indicating a table name subsequently
