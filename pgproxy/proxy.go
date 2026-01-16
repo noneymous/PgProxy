@@ -1181,7 +1181,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Return and end client receiver
 				return
 			}
-			logger.Debugf("Received frontend message (client request): %s", spew.Sdump(msgFrontend))
+			logger.Debugf("Received frontend message (client request).")
+			//logger.Debugf("Received frontend message (client request):\n%s", spew.Sdump(msgFrontend))
 
 			// Forwarding query data to database receiver routine
 			if p.fnMonitoring != nil {
@@ -1365,7 +1366,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				// Return and end database receiver
 				return
 			}
-			logger.Debugf("Received backend message (database response): %s", spew.Sdump(msgBackend))
+			logger.Debugf("Received backend message (database response).")
+			//logger.Debugf("Received backend message (database response):\n%s", spew.Sdump(msgBackend))
 
 			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
