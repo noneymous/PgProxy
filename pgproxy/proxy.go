@@ -1224,10 +1224,25 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					}
 
 				case *pgproto3.Parse: // Client requesting to parse a prepared statement
-					logger.Debugf("Request  Type '%T', registering query.", msgFrontend)
+					logger.Debugf("Request  Type '%T', registering query and adding query to statement sequence.", msgFrontend)
+
+					// Prepare query
+					query := trimEmptySyntax(q.Query)
 
 					// Add query to prepared statement cache
-					statementCache[q.Name] = trimEmptySyntax(q.Query)
+					logger.Debugf("Caching query: \n%s", "    "+strings.Join(strings.Split(query, "\n"), "\n    "))
+					logger.Debugf("Caching bytes: %v", []byte(query))
+					statementCache[q.Name] = query
+
+					// Parse does trigger query evaluation on the backend side, which may result in a ErrorResponse,
+					// e.g. in case of a syntax error, in which case we want to log the faulty query. Hence, we need
+					// to add the query to the statement queue where we directly skip it in case of a ParseComplete
+					// response. We just need it there in case of an ErrorResponse.
+					statementSequence = append(statementSequence, &Statement{
+						Query:      query,
+						QueryInput: query,
+						Start:      time.Now(),
+					})
 
 				case *pgproto3.Bind: // Client requesting to load a previously parsed prepared statement
 					logger.Debugf("Request  Type '%T', loading query.", msgFrontend)
@@ -1446,6 +1461,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Postgres returns one DataRow response per result ROW!
 					// Don't log, because it would bloat the log file.
 					statementRows++
+
+				case *pgproto3.ParseComplete:
+
+					// Increment statement pointer
+					statement++
 
 				case *pgproto3.CommandComplete:
 
