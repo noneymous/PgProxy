@@ -1174,6 +1174,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					pgConn.Terminated = true
 				} else if errors.As(errMsgFrontend, &opError) {
 					logger.Debugf("Could not read from client, connection terminated: %s", opError)
+					pgConn.Terminated = true
 				} else { // Unexpected error
 					logger.Errorf("Proxying data from client failed: %s.", errMsgFrontend)
 				}
@@ -1538,12 +1539,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				var opError *net.OpError
 				if errors.Is(errSend, io.ErrUnexpectedEOF) { // Connection closed by client
 					logger.Debugf("Could not send to client, connection terminated.")
+					pgConn.Terminated = true
 				} else if errors.Is(errSend, os.ErrDeadlineExceeded) { // Connection closed by PgProxy because client was inactive
 					logger.Infof("Could not send to client, connection terminated due to inactivity.")
+					pgConn.Terminated = true
 				} else if errors.Is(errSend, net.ErrClosed) { // Connection already closed by PgProxy
 					logger.Debugf("Could not send to client, connection already closed.")
+					pgConn.Terminated = true
 				} else if errors.As(errSend, &opError) {
 					logger.Debugf("Could not send to client, connection terminated: %s", opError)
+					pgConn.Terminated = true
 				} else { // Unexpected error
 					logger.Errorf("Proxying data to client failed: %s.", errSend)
 				}
