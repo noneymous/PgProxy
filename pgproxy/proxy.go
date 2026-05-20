@@ -1196,6 +1196,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Single SQL statements are sanitized already.
 					queries := splitQueries(q.String)
 
+					// The database will execute the query sent by the user and drop intermittent empty queries.
+					// If there are no queries at all, the database will still process it as an empty query and
+					// respond with EmptyQueryResponse. In that case we still need to register the standalone
+					// empty query in our statement sequence.
+					if len(queries) == 0 {
+						queries = []string{""}
+					}
+
 					// Log action
 					if len(queries) == 1 {
 						logger.Debugf("Request  Type '%T', adding query to statement sequence.", msgFrontend)
@@ -1750,13 +1758,6 @@ func splitQueries(sql string) []string {
 
 	// Cleanup empty characters from both ends
 	sql = trimEmptySyntax(sql)
-
-	// If the query did not contain any query, return an empty query
-	// It will be still sent to the database which returns an EmptyQuery
-	// response, so PgProxy still needs to have it in the statement queue.
-	if len(sql) == 0 {
-		return []string{""}
-	}
 
 	// Define parse states
 	const ( // iota is reset to 0
