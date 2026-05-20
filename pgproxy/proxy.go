@@ -1428,8 +1428,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 					)
 
-					// Skip subsequent already known queries, because they will be
-					// skipped by the database after this error
+					// Skip subsequent already known queries, because they will be skipped by the
+					// database after this error. Database will ignore all requests until the client
+					// sends a sync request.
 					statement = len(statementSequence)
 
 				case *pgproto3.EmptyQueryResponse, *pgproto3.PortalSuspended: // Responses from empty query strings
@@ -1749,6 +1750,13 @@ func splitQueries(sql string) []string {
 
 	// Cleanup empty characters from both ends
 	sql = trimEmptySyntax(sql)
+
+	// If the query did not contain any query, return an empty query
+	// It will be still sent to the database which returns an EmptyQuery
+	// response, so PgProxy still needs to have it in the statement queue.
+	if len(sql) == 0 {
+		return []string{""}
+	}
 
 	// Define parse states
 	const ( // iota is reset to 0
