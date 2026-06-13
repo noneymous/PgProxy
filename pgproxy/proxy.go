@@ -1310,6 +1310,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Exit goroutine if necessary
 			select {
 			case <-p.ctx.Done():
+				pgConn.Terminated = true
 				return
 			default:
 			}
@@ -1589,6 +1590,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Exit goroutine if necessary
 			select {
 			case <-p.ctx.Done():
+				pgConn.Terminated = true
 				return
 			default:
 			}
