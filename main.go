@@ -18,9 +18,9 @@ var snis = []pgproxy.Sni{
 		CertPath: "./keys/localhost_dev.crt", // Example self-signed certificate to be presented to the client
 		KeyPath:  "./keys/localhost_dev.key", // Example self-signed certificate to be presented to the client
 		Database: pgproxy.Database{
-			Host:    "postgres.domain.tld", // The database host to proxy the client to
-			Port:    5432,                  // The database port  to proxy the client to
-			SslMode: "prefer",              // one out of pgproxy.SslModes
+			Host:    "localhost", // The database host to proxy the client to
+			Port:    5432,        // The database port  to proxy the client to
+			SslMode: "prefer",    // one out of pgproxy.SslModes
 		},
 		AllowedOrigins: nil, // Option to restrict access to SNI for a list of origin IPs
 	},

@@ -479,11 +479,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Get connection to cancel by key
 			pgConn, okPgConn := p.connections.Get(k)
 			if !okPgConn {
-				logger.Warningf(
-					"Cancel request from '%s' for unknown connection '%T'.",
-					client.RemoteAddr().String(),
-					keyData,
-				)
+				logger.Infof("Cancel request from '%s' for unknown connection '%s'.", client.RemoteAddr().String(), k)
 				return // Abort in case of unknown connection ID. Without, we can't know which DB server to dispatch to.
 			}
 
