@@ -60,3 +60,30 @@ Please refer to main.go for a fully working sample
 	pgProxy.Serve()
 
 ```
+
+## Tests
+
+Run `go test ./...` for unit and protocol regression tests. Integration tests additionally need local PostgreSQL
+executables. Configure `PostgresBinDir` in `_test/settings.go`, or provide it with Go's linker flag:
+
+Linux (with a C compiler installed for the race detector):
+
+```sh
+GOTOOLCHAIN=go1.26.8 CGO_ENABLED=1 go test -race ./... -ldflags='-X github.com/noneymous/PgProxy/_test.PostgresBinDir=/usr/lib/postgresql/18/bin'
+```
+
+Windows PowerShell (without the race detector):
+
+```powershell
+$env:GOTOOLCHAIN = 'go1.26.8'
+go test ./... -ldflags='-X "github.com/noneymous/PgProxy/_test.PostgresBinDir=C:/Program Files/PostgreSQL/18/bin"'
+```
+
+Adjust the PostgreSQL binary path to your installation. On Windows, `-race` additionally requires `CGO_ENABLED=1`
+and a Go-compatible C compiler on `PATH`; alternatively, run the Linux command inside WSL. The `_test` directory is
+an explicitly imported configuration package, not a test-discovery target of `./...`. Its full import path in `-X`
+sets the configuration used by the integration tests in `pgproxy/`.
+
+The integration tests create disposable, loopback-only clusters and dummy users under `_test/artifacts/`. They do not
+use existing databases. Generated clusters and certificates are removed after the tests. Use a current patched Go
+toolchain for release builds; validation of this migration used Go 1.26.8 and PostgreSQL 18.

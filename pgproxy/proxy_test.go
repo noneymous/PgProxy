@@ -1,10 +1,13 @@
 package pgproxy
 
 import (
+	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
+	scanUtils "github.com/siemens/GoScans/utils"
 )
 
 func Test_splitQueries(t *testing.T) {
@@ -196,6 +199,90 @@ ORDER BY oid, enumsortorder`,
 		t.Run(tt.name, func(t *testing.T) {
 			if got := splitQueries(tt.sql); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("splitQueries() = %v, want %v", spew.Sdump(got), spew.Sdump(tt.want))
+			}
+		})
+	}
+}
+
+// TestPrettify_FallbackCleanup_PreservesFormatting verifies cleanup applies to successful and failed formatting
+func TestPrettify_FallbackCleanup_PreservesFormatting(t *testing.T) {
+
+	// Prepare unit test data for the normal path and each input-dependent fallback
+	tests := []struct {
+		name        string
+		query       string
+		wantSql     string
+		wantTables  []string
+		wantWarning string
+	}{
+		{
+			name:    "empty",
+			query:   "",
+			wantSql: "",
+		},
+		{
+			name:    "whitespace-only",
+			query:   " \t\n\n\r ",
+			wantSql: "",
+		},
+		{
+			name:       "formatted-query-with-table",
+			query:      "  select id from example_table  ",
+			wantSql:    "SELECT\n  id\nFROM example_table",
+			wantTables: []string{"example_table"},
+		},
+		{
+			name:        "tokenizer-error-empty-lines",
+			query:       "\n\tSELECT\n\n'unterminated\n",
+			wantSql:     "SELECT\n'unterminated",
+			wantWarning: "Could not tokenize query:",
+		},
+		{
+			name:        "tokenizer-error-whitespace-normalization",
+			query:       "\nSELECT    id\n\nFROM\texample_table\nWHERE name = 'unterminated\n",
+			wantSql:     "SELECT  id\nFROM  example_table\nWHERE name = 'unterminated",
+			wantWarning: "Could not tokenize query:",
+		},
+		{
+			name:        "tokenizer-error-escaped-quote",
+			query:       "SELECT E'\\''\n\nFROM example_table",
+			wantSql:     "SELECT E'\\''\nFROM example_table",
+			wantWarning: "Could not tokenize query:",
+		},
+		{
+			name:        "parser-error-retains-tables-and-cleanup",
+			query:       "\nUNSUPPORTED\n\nFROM example_table\n",
+			wantSql:     "UNSUPPORTED\nFROM example_table",
+			wantTables:  []string{"example_table"},
+			wantWarning: "Could not parse query:",
+		},
+	}
+
+	// Prepare and run test cases
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			// Capture real formatter diagnostics without replacing its dependencies
+			var logs bytes.Buffer
+			logger := scanUtils.NewTestLogger()
+			logger.SetOutput(&logs)
+			tables, sql := prettify(logger, test.query)
+
+			// Verify final cleanup and table extraction on both normal and fallback paths
+			if sql != test.wantSql {
+				t.Errorf("prettify() SQL = '%s', want = '%s'", sql, test.wantSql)
+			}
+			if !reflect.DeepEqual(tables, test.wantTables) {
+				t.Errorf("prettify() tables = '%v', want = '%v'", tables, test.wantTables)
+			}
+
+			// Verify failed formatting produces one warning without cascading diagnostics
+			if test.wantWarning == "" {
+				if logs.Len() != 0 {
+					t.Errorf("prettify() logs = '%s', want = ''", logs.String())
+				}
+			} else if !strings.Contains(logs.String(), test.wantWarning) || strings.Count(logs.String(), "Could not ") != 1 {
+				t.Errorf("prettify() logs = '%s', want = 'one %s warning'", logs.String(), test.wantWarning)
 			}
 		})
 	}

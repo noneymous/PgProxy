@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,8 +20,8 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/noneymous/go-sqlfmt/sqlfmt"
 	"github.com/noneymous/go-sqlfmt/sqlfmt/formatters"
@@ -53,7 +52,7 @@ func (e *ErrCertificate) Error() string {
 type PgConn struct {
 	Uuid            string // random string identifying log messages of this connection stream
 	Pid             uint32
-	Sid             uint32
+	Sid             []byte // PostgreSQL cancellation keys may contain more than four bytes
 	Db              string
 	User            string
 	Application     string
@@ -61,8 +60,9 @@ type PgConn struct {
 	TimestampLast   time.Time
 	AddressDatabase string
 	AddressClient   string
-	InProgress      bool // Flag whether a query is currently in execution
-	Terminated      bool // Flag whether Termination was requested by client
+	InProgress      bool       // Flag whether a query is currently in execution
+	Terminated      bool       // Flag whether Termination was requested by client
+	stateLock       sync.Mutex // Protects mutable connection state shared by forwarding and logging goroutines
 }
 
 // PgReverseProxy defines a Postgres reverse proxy listening on a certain port, accepting incoming client
@@ -361,7 +361,16 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}
 
 	// Prepare client backend to receive client messages
-	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(client), client)
+	clientBackend := pgproto3.NewBackend(client, client)
+
+	// Flush each message immediately and keep error notifications from racing with forwarded responses
+	var clientSendLock sync.Mutex
+	sendClient := func(message pgproto3.BackendMessage) error {
+		clientSendLock.Lock()
+		defer clientSendLock.Unlock()
+		clientBackend.Send(message)
+		return clientBackend.Flush()
+	}
 
 	// Prepare memory for error message to be transferred to client
 	var clientErrMsg *pgconn.PgError
@@ -394,7 +403,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Log and execute action
 		logger.Debugf("Forwarding error response to client.")
-		errSend := clientBackend.Send(errResp)
+		errSend := sendClient(errResp)
 
 		// Log error with respective criticality
 		var opError *net.OpError
@@ -495,18 +504,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					k,
 					errDatabaseCancel,
 				)
+				return // Abort before using a connection that could not be established
 			}
 			defer func() { _ = databaseCancel.Close() }()
 
-			// Prepare cancel data
-			buf := make([]byte, 16)
-			binary.BigEndian.PutUint32(buf[0:4], 16)
-			binary.BigEndian.PutUint32(buf[4:8], 80877102)
-			binary.BigEndian.PutUint32(buf[8:12], m.ProcessID)
-			binary.BigEndian.PutUint32(buf[12:16], m.SecretKey)
-
-			// Send cancel request on connection
-			_, errWrite := databaseCancel.Write(buf)
+			// Forward the complete cancellation key, including longer keys used by newer PostgreSQL versions
+			cancelFrontend := pgproto3.NewFrontend(databaseCancel, databaseCancel)
+			cancelFrontend.Send(m)
+			errWrite := cancelFrontend.Flush()
 			if errWrite != nil {
 				logger.Errorf(
 					"Cancel request from '%s' for connection '%s' failed: %s",
@@ -518,7 +523,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Set terminated flag for processing goroutine to know
+			pgConn.stateLock.Lock()
 			pgConn.Terminated = true
+			pgConn.stateLock.Unlock()
 
 			// Log success and abort further communication
 			logger.Debugf("Cancel request successful.")
@@ -579,7 +586,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Upgrade client backend to receive future client messages
-			clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(clientTls), clientTls)
+			clientBackend = pgproto3.NewBackend(clientTls, clientTls)
 
 		case *pgproto3.GSSEncRequest:
 
@@ -640,7 +647,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Request password from client
 	logger.Debugf("Requesting authentication password from client.")
-	errClientSend := clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
+	errClientSend := sendClient(&pgproto3.AuthenticationCleartextPassword{})
 	if errClientSend != nil {
 		logger.Errorf("Client startup failed: could not request password: %s.", errClientSend)
 		return // Abort in case of communication error
@@ -721,8 +728,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	defer func() { _ = database.Close() }()
 
 	// Prepare database frontend to receive database messages
-	databaseReader := pgproto3.NewChunkReader(database)
-	databaseFrontend := pgproto3.NewFrontend(databaseReader, database)
+	databaseFrontend := pgproto3.NewFrontend(database, database)
 
 	/////////////////////////////////////////////////
 	// Upgrade database connection to SSL, if desired
@@ -745,7 +751,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		logger.Debugf("Upgrading database connection to SSL.")
 
 		// Send SSL request
-		errDatabaseSend := databaseFrontend.Send(&pgproto3.SSLRequest{})
+		databaseFrontend.Send(&pgproto3.SSLRequest{})
+		errDatabaseSend := databaseFrontend.Flush()
 		if errDatabaseSend != nil {
 
 			// Set error details to be forwarded to client
@@ -756,8 +763,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			return // Abort in case of communication error
 		}
 
-		// Read SSL response
-		rDatabase, errDatabaseR := databaseReader.Next(1)
+		// Read only the SSL response byte so no TLS handshake bytes are buffered outside the TLS connection
+		var rDatabase [1]byte
+		_, errDatabaseR := io.ReadFull(database, rDatabase[:])
 		if errDatabaseR != nil {
 
 			// Set error details to be forwarded to client
@@ -771,7 +779,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		// Process database response
 		if rDatabase[0] == 'N' {
 
-			if listenerConfig.Database.SslMode == "require" {
+			// Only explicitly optional TLS modes may fall back to an unencrypted database connection
+			if listenerConfig.Database.SslMode != "allow" && listenerConfig.Database.SslMode != "prefer" {
 
 				// Set error details to be forwarded to client
 				clientErrMsg = ErrInternal
@@ -803,37 +812,23 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			}
 
 			// Upgrade database frontend to receive future client messages
-			databaseFrontend = pgproto3.NewFrontend(pgproto3.NewChunkReader(databaseTls), databaseTls)
+			databaseFrontend = pgproto3.NewFrontend(databaseTls, databaseTls)
 
 		} else if rDatabase[0] == 'E' {
 
 			// Set error details to be forwarded to client
 			clientErrMsg = ErrInternal
 
-			// Read error header
-			header, errHeader := databaseReader.Next(4)
-			if errHeader != nil {
-				logger.Errorf("Database startup failed: could not read SSL error header: %s.", errHeader)
-				return // Abort in case of communication error
-			}
-
-			// Read error message
-			length := int(binary.BigEndian.Uint32(header)) - 4
-			message, errMessage := databaseReader.Next(length)
+			// Restore the consumed message type and let the protocol decoder validate the complete error response
+			errorFrontend := pgproto3.NewFrontend(io.MultiReader(bytes.NewReader(rDatabase[:]), database), database)
+			message, errMessage := errorFrontend.Receive()
 			if errMessage != nil {
 				logger.Errorf("Database startup failed: could not read SSL error message: %s.", errMessage)
 				return // Abort in case of communication error
 			}
 
-			// Decode error message
-			var messageDecoded pgproto3.ErrorResponse
-			errDecode := messageDecoded.Decode(message)
-			if errDecode != nil {
-				logger.Errorf("Database startup failed: could not decode SSL error message: %s.", errDecode)
-				return // Abort in case of communication error
-			}
-
 			// Log negotiation error and abort
+			messageDecoded := message.(*pgproto3.ErrorResponse) // The already-read 'E' identifies an ErrorResponse
 			logger.Errorf(
 				"Database startup failed: could not negotiate SSL: %s (%s).",
 				messageDecoded.Message,
@@ -858,7 +853,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	logger.Debugf("Initializing database connection.")
 
 	// Forward client startup data to database
-	errDatabaseSend := databaseFrontend.Send(startupRaw)
+	databaseFrontend.Send(startupRaw)
+	errDatabaseSend := databaseFrontend.Flush()
 	if errDatabaseSend != nil {
 
 		// Set error details to be forwarded to client
@@ -895,7 +891,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		case *pgproto3.AuthenticationCleartextPassword:
 
 			// Send Password in cleartext
-			errSend := databaseFrontend.Send(startupPassword)
+			databaseFrontend.Send(startupPassword)
+			errSend := databaseFrontend.Flush()
 			if errSend != nil {
 
 				// Set error details to be forwarded to client
@@ -917,7 +914,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			passwordMd5 := "md5" + hex.EncodeToString(checksum2[:])
 
 			// Send Password as MD5
-			errSend := databaseFrontend.Send(&pgproto3.PasswordMessage{Password: passwordMd5})
+			databaseFrontend.Send(&pgproto3.PasswordMessage{Password: passwordMd5})
+			errSend := databaseFrontend.Flush()
 			if errSend != nil {
 
 				// Set error details to be forwarded to client
@@ -982,7 +980,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Respond to client with AuthTypeOk
 	_ = clientBackend.SetAuthType(pgproto3.AuthTypeOk)
-	errClientSend = clientBackend.Send(&pgproto3.AuthenticationOk{})
+	errClientSend = sendClient(&pgproto3.AuthenticationOk{})
 	if errClientSend != nil {
 
 		// Set error details to be forwarded to client
@@ -1031,7 +1029,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 		}
 
 		// Copy to database
-		errSend := clientBackend.Send(response)
+		errSend := sendClient(response)
 		if errSend != nil {
 
 			// Set error details to be forwarded to client
@@ -1059,7 +1057,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	///////////////////////////////////////////////////////////////////////
 	// Cache connections for later lookups, e.g. to execute cancel requests
 	///////////////////////////////////////////////////////////////////////
-	logger.Infof("Connection '%d-%d' (PID-SID).", keyData.ProcessID, keyData.SecretKey)
+	logger.Infof("Connection '%d-%x' (PID-SID).", keyData.ProcessID, keyData.SecretKey)
 	logger.Debugf("Caching connection details.")
 
 	// Cache key data and associated database connection if available
@@ -1072,7 +1070,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	pgConn := PgConn{
 		Uuid:            uuid,
 		Pid:             keyData.ProcessID, // Might be 0 if no key data is available
-		Sid:             keyData.SecretKey, // Might be 0 if no key data is available
+		Sid:             keyData.SecretKey, // Might be empty if no key data is available
 		Db:              startupRaw.Parameters["database"],
 		User:            startupRaw.Parameters["user"],
 		Application:     startupRaw.Parameters["application_name"],
@@ -1101,10 +1099,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Prepare done channel to terminate goroutines
 	chDone := make(chan struct{}, 2)
-	defer close(chDone)
 
-	// Prepare wait group to wait for remaining goroutines
+	// Register both receivers before launching them so shutdown always waits for their complete cleanup
 	wg := new(sync.WaitGroup)
+	wg.Add(2)
 
 	// Prepare buffered channel for communication between query and response
 	type Statement struct {
@@ -1116,6 +1114,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Prepare slice to recorde the sequence of queries sent to the database.
 	// This slice can be used to map later database responses to their original query request.
 	var statementSequence []*Statement
+	var statementLock sync.Mutex
 
 	// Disable client timeout, client might hold connection ready.
 	errDeadline = client.SetDeadline(time.Time{})
@@ -1126,15 +1125,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Listen for client requests
 	go func() {
 
+		// Signal completion only after all receiver cleanup and done notifications have finished
+		defer wg.Done()
+
 		// Log termination
 		defer func() { logger.Debugf("Client receiver terminated.") }()
 
 		// Indicate end of communication to unblock parent goroutine
 		defer func() { chDone <- struct{}{} }()
-
-		// Increase wait group and make sure to decrease on termination
-		wg.Add(1)
-		defer wg.Done()
 
 		// Catch potential panics to gracefully log issue with stacktrace
 		defer func() {
@@ -1156,6 +1154,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Receive from client
 			msgFrontend, errMsgFrontend := clientBackend.Receive()
 			if errMsgFrontend != nil {
+
+				// Protect termination state until this receiver returns
+				pgConn.stateLock.Lock()
+				defer pgConn.stateLock.Unlock()
 
 				// Log error with respective criticality
 				var opError *net.OpError
@@ -1211,11 +1213,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					for _, query := range queries {
 						logger.Debugf("Queueing query: \n%s", "    "+strings.Join(strings.Split(query, "\n"), "\n    "))
 						logger.Debugf("Queueing bytes: %v", []byte(query))
+						statementLock.Lock()
 						statementSequence = append(statementSequence, &Statement{
 							Query:      query,
 							QueryInput: q.String,
 							Start:      time.Now(),
 						})
+						statementLock.Unlock()
 					}
 
 					// Print raw string bytes for debuggability
@@ -1223,8 +1227,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Switch connection state to active
 					if len(queries) > 0 {
+						pgConn.stateLock.Lock()
 						pgConn.TimestampLast = time.Now()
 						pgConn.InProgress = true
+						pgConn.stateLock.Unlock()
 					}
 
 				case *pgproto3.Parse: // Client requesting to parse a prepared statement
@@ -1242,11 +1248,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// e.g. in case of a syntax error, in which case we want to log the faulty query. Hence, we need
 					// to add the query to the statement queue where we directly skip it in case of a ParseComplete
 					// response. We just need it there in case of an ErrorResponse.
+					statementLock.Lock()
 					statementSequence = append(statementSequence, &Statement{
 						Query:      query,
 						QueryInput: query,
 						Start:      time.Now(),
 					})
+					statementLock.Unlock()
 
 				case *pgproto3.Bind: // Client requesting to load a previously parsed prepared statement
 					logger.Debugf("Request  Type '%T', loading query.", msgFrontend)
@@ -1264,15 +1272,19 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Queueing bytes: %v", []byte(queryBound))
 
 					// Add query to statement sequence
+					statementLock.Lock()
 					statementSequence = append(statementSequence, &Statement{
 						Query:      queryBound,
 						QueryInput: queryBound,
 						Start:      time.Now(),
 					})
+					statementLock.Unlock()
 
 					// Switch connection state to active
+					pgConn.stateLock.Lock()
 					pgConn.TimestampLast = time.Now()
 					pgConn.InProgress = true
+					pgConn.stateLock.Unlock()
 
 				case *pgproto3.Terminate:
 					logger.Debugf("Request  Type '%T'.", msgFrontend)
@@ -1287,7 +1299,8 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Forward to database
 			logger.Debugf("Forwarding frontend message.")
-			errSend := databaseFrontend.Send(msgFrontend)
+			databaseFrontend.Send(msgFrontend)
+			errSend := databaseFrontend.Flush()
 			if errSend != nil {
 
 				// Log error
@@ -1306,7 +1319,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Exit goroutine if necessary
 			select {
 			case <-p.ctx.Done():
+				pgConn.stateLock.Lock()
 				pgConn.Terminated = true
+				pgConn.stateLock.Unlock()
 				return
 			default:
 			}
@@ -1316,15 +1331,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Listen for database responses
 	go func() {
 
+		// Signal completion only after all receiver cleanup and done notifications have finished
+		defer wg.Done()
+
 		// Log termination
 		defer func() { logger.Infof("Database receiver terminated.") }()
 
 		// Indicate end of communication to unblock parent goroutine
 		defer func() { chDone <- struct{}{} }()
-
-		// Increase wait group and make sure to decrease on termination
-		wg.Add(1)
-		defer wg.Done()
 
 		// Prepare process variables
 		var statement = 0               // Current SQL statement pointer in a sequence of statements
@@ -1340,7 +1354,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 		// Check if there were remaining queries at the end and warn about for debugging purposes
 		defer func() {
-			if pgConn.Terminated {
+
+			// Read termination state before inspecting the shared statement sequence
+			pgConn.stateLock.Lock()
+			terminated := pgConn.Terminated
+			pgConn.stateLock.Unlock()
+			statementLock.Lock()
+			defer statementLock.Unlock()
+			if terminated {
 				// Termination requested or client disconnected, remaining queued queries might not get executed anymore
 			} else if statement < len(statementSequence) {
 
@@ -1393,6 +1414,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Execute statement monitoring if activated
 			if p.fnMonitoring != nil {
 
+				// Snapshot the slice header while requests may append, without holding a lock during response handling
+				statementLock.Lock()
+				sequence := statementSequence
+				statementLock.Unlock()
+
 				// Act on response depending on type
 				switch resp := msgBackend.(type) {
 				case *pgproto3.ErrorResponse:
@@ -1400,9 +1426,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Get associated query
 					query := ""
 					queryInput := ""
-					if statement < len(statementSequence) {
-						query = statementSequence[statement].Query
-						queryInput = statementSequence[statement].QueryInput
+					if statement < len(sequence) && sequence[statement] != nil {
+						query = sequence[statement].Query
+						queryInput = sequence[statement].QueryInput
 					} else if resp.Code == "57P01" { // admin_shutdown - Terminating connection due to administrator command
 						// Sent by the database without client trigger, so there might be no associated query.
 					} else if resp.Code == "08P01" { // protocol_violation - Client sent unexpected message
@@ -1436,16 +1462,26 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// Skip subsequent already known queries, because they will be skipped by the
 					// database after this error. Database will ignore all requests until the client
 					// sends a sync request.
+					statementLock.Lock()
 					statement = len(statementSequence)
+					statementLock.Unlock()
 
 				case *pgproto3.EmptyQueryResponse, *pgproto3.PortalSuspended: // Responses from empty query strings
 
 					// Postgres returns EmptyQueryResponse if there was nothing to execute
 					logger.Debugf("Response Type '%T'.", resp)
 
+					// Reject an unexpected response before acquiring the lock needed to release its statement
+					if statement >= len(sequence) || sequence[statement] == nil {
+						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
+						return
+					}
+
 					// Release memory of statement, it's not needed anymore
 					// Do not reset whole statementSequence because subsequent queries might already be queued!
+					statementLock.Lock()
 					statementSequence[statement] = nil
+					statementLock.Unlock()
 
 					// Increment statement pointer
 					statement++
@@ -1484,7 +1520,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Infof("Response Type '%T', logging statement.", resp)
 
 					// Get associated query data
-					queryData := statementSequence[statement]
+					if statement >= len(sequence) || sequence[statement] == nil {
+						logger.Errorf("Statement %d does not exist in statement sequence.", statement)
+						return
+					}
+					queryData := sequence[statement]
 
 					// Get query, prettify and unify for logging
 					tables, query := prettify(logger, queryData.Query)
@@ -1516,7 +1556,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 					// Release memory of statement, it's not needed anymore
 					// Do not reset whole statementSequence because subsequent queries might already be queued!
+					statementLock.Lock()
 					statementSequence[statement] = nil
+					statementLock.Unlock()
 
 					// Increment statement pointer
 					statement++
@@ -1540,7 +1582,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 						startupRaw.Parameters["application_name"] = resp.Value
 
 						// Switch connection state to passive
+						pgConn.stateLock.Lock()
 						pgConn.Application = resp.Value
+						pgConn.stateLock.Unlock()
 					}
 
 				case *pgproto3.ReadyForQuery:
@@ -1549,7 +1593,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					logger.Debugf("Response Type '%T'.", resp)
 
 					// Switch connection state to passive
+					pgConn.stateLock.Lock()
 					pgConn.InProgress = false
+					pgConn.stateLock.Unlock()
 
 				default:
 					logger.Debugf("Response Type '%T'.", resp)
@@ -1558,8 +1604,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 			// Forward to client
 			logger.Debugf("Forwarding backend message.")
-			errSend := clientBackend.Send(msgBackend)
+			errSend := sendClient(msgBackend)
 			if errSend != nil {
+
+				// Protect termination state until this receiver returns
+				pgConn.stateLock.Lock()
+				defer pgConn.stateLock.Unlock()
 
 				// Log error with respective criticality
 				var opError *net.OpError
@@ -1586,7 +1636,9 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Exit goroutine if necessary
 			select {
 			case <-p.ctx.Done():
+				pgConn.stateLock.Lock()
 				pgConn.Terminated = true
+				pgConn.stateLock.Unlock()
 				return
 			default:
 			}
@@ -1594,16 +1646,10 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	}()
 
 	// Wait until communication ended or PgProxy got stopped
-	func() {
-		for {
-			select {
-			case <-p.ctx.Done():
-				return
-			case _ = <-chDone:
-				return
-			}
-		}
-	}()
+	select {
+	case <-p.ctx.Done():
+	case <-chDone:
+	}
 
 	// Log waiting
 	logger.Debugf("Waiting for remaining receiver.")
@@ -1611,10 +1657,6 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 	// Close client and database connections to resolve potentially blocking Receive() calls in goroutines
 	_ = database.Close()
 	_ = client.Close()
-
-	// Read remaining done signal to unblock remaining receiver goroutine. There are always two,
-	// one listening for client communication and one listening for database communication.
-	<-chDone
 
 	// Wait for all goroutines
 	wg.Wait()
@@ -1641,20 +1683,27 @@ func (p *PgReverseProxy) logConnections() {
 
 		// Build log message
 		for _, clientConnection := range clientConnections {
+
+			// Snapshot mutable state without holding a lock while formatting or writing logs
+			clientConnection.stateLock.Lock()
+			client := clientConnection.Application
+			last := clientConnection.TimestampLast
+			inProgress := clientConnection.InProgress
+			clientConnection.stateLock.Unlock()
+
+			// Format the connection summary
 			user := clientConnection.User
 			if len(user) > 20 {
 				user = user[:17] + "..."
 			}
-			client := clientConnection.Application
 			if len(client) > 25 {
 				client = client[:22] + "..."
 			}
-			last := clientConnection.Timestamp
-			if !clientConnection.TimestampLast.IsZero() {
-				last = clientConnection.TimestampLast
+			if last.IsZero() {
+				last = clientConnection.Timestamp
 			}
 			state := "Pssv"
-			if clientConnection.InProgress {
+			if inProgress {
 				state = "Actv"
 			}
 			addr := clientConnection.AddressClient
@@ -1684,7 +1733,7 @@ func (p *PgReverseProxy) logConnections() {
 
 // generateKey is a helper function for uniformity, generating a backend key data identifier string
 func generateKey(keyData *pgproto3.BackendKeyData) string {
-	return fmt.Sprintf("%d-%d", keyData.ProcessID, keyData.SecretKey)
+	return fmt.Sprintf("%d-%x", keyData.ProcessID, keyData.SecretKey)
 }
 
 // saslAuth is an adapted version of github.com/jackc/pgconn (auth_scram.go) making it return proper error details.
@@ -1701,7 +1750,8 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 		AuthMechanism: "SCRAM-SHA-256",
 		Data:          sc.clientFirstMessage(),
 	}
-	if errSend := fe.Send(saslInitialResponse); errSend != nil {
+	fe.Send(saslInitialResponse)
+	if errSend := fe.Flush(); errSend != nil {
 		return errSend
 	}
 
@@ -1728,7 +1778,8 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 	saslResponse := &pgproto3.SASLResponse{
 		Data: []byte(sc.clientFinalMessage()),
 	}
-	if errSendResp := fe.Send(saslResponse); errSendResp != nil {
+	fe.Send(saslResponse)
+	if errSendResp := fe.Flush(); errSendResp != nil {
 		return errSendResp
 	}
 
@@ -1884,78 +1935,79 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		query = strings.Join(lines, "\n")
 	}
 
-	// Prepare warn flag to avoid duplicate reporting
-	warned := false
+	// Keep the normalized query as fallback while still applying the final cleanup below
+	sql = query
 
 	// Tokenize query
 	tokens, errTokenizer := lexer.Tokenize(query)
 	if errTokenizer != nil {
-		warned = true
 		logger.Warningf(
 			"Could not tokenize query: %s:\n%s",
 			errTokenizer,
 			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
 		)
-		// Warn about issue, but continue
-	}
+	} else {
 
-	// Search token tree for FROM tables names
-	tables = findTableNames(tokens)
+		// Prepare warn flag to avoid duplicate reporting
+		warned := false
 
-	// Prepare formatter options
-	options := formatters.DefaultOptions()
+		// Only complete tokens can be parsed safely or used to extract table names
+		tables = findTableNames(tokens)
 
-	// Parse query clauses from tokens
-	tokensParsed, errParse := parser.Parse(tokens, options)
-	if errParse != nil && !warned {
-		warned = true
-		logger.Warningf(
-			"Could not parse query: %s:\n%s",
-			errParse,
-			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-		)
-		// Warn about issue, but continue
-	}
+		// Prepare formatter options and avoid duplicate warnings from later stages
+		options := formatters.DefaultOptions()
 
-	// Format parsed tokens into buffer
-	var sqlBuf bytes.Buffer
-	var errFormat error
-	for _, tokenParsed := range tokensParsed {
-		errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
-		if errFormat != nil {
-			break
+		// Parse query clauses from tokens
+		tokensParsed, errParse := parser.Parse(tokens, options)
+		if errParse != nil {
+			warned = true
+			logger.Warningf(
+				"Could not parse query: %s:\n%s",
+				errParse,
+				"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+			)
+			// Warn about issue, but continue
 		}
-	}
 
-	// Log formatting issue
-	if errFormat != nil && !warned {
-		warned = true
-		logger.Warningf(
-			"Could not format query: %s:\n%s",
-			errFormat,
-			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-		)
-		// Warn about issue, but continue
-	}
+		// Format parsed tokens into buffer
+		var sqlBuf bytes.Buffer
+		var errFormat error
+		for _, tokenParsed := range tokensParsed {
+			errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
+			if errFormat != nil {
+				break
+			}
+		}
 
-	// Get formatted sql string
-	sql = sqlBuf.String()
+		// Log formatting issue
+		if errFormat != nil && !warned {
+			warned = true
+			logger.Warningf(
+				"Could not format query: %s:\n%s",
+				errFormat,
+				"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+			)
+			// Warn about issue, but continue
+		}
 
-	// Compare if formatted query still has the same logic as input
-	valid := sqlfmt.CompareSemantic(query, sql)
-	if !valid && !warned {
-		warned = true
-		logger.Warningf(
-			"Could not prettify query, output diverges:\n%s\n    |!=--->\n%s",
-			"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
-			"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
-		)
-		// Warn about issue, but continue
-	}
+		// Get formatted sql string
+		sql = sqlBuf.String()
 
-	// Reset formatted SQL string to original input if there was an error
-	if !valid || errFormat != nil || errParse != nil || errTokenizer != nil {
-		sql = query
+		// Compare if formatted query still has the same logic as input
+		valid := sqlfmt.CompareSemantic(query, sql)
+		if !valid && !warned {
+			logger.Warningf(
+				"Could not prettify query, output diverges:\n%s\n    |!=--->\n%s",
+				"    "+strings.Join(strings.Split(query, "\n"), "\n    "),
+				"    "+strings.Join(strings.Split(sql, "\n"), "\n    "),
+			)
+			// Warn about issue, but continue
+		}
+
+		// Reset formatted SQL string to original input if there was an error
+		if !valid || errFormat != nil || errParse != nil {
+			sql = query
+		}
 	}
 
 	// Remove empty lines
