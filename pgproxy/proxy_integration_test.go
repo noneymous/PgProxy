@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -121,8 +122,8 @@ func TestPgReverseProxy_RequiredTls_RejectsPlaintextFallback(t *testing.T) {
 	}
 }
 
-// TestPgReverseProxy_UntrackedCompletion_ClosesWithoutPanic verifies mismatched monitoring state fails cleanly
-func TestPgReverseProxy_UntrackedCompletion_ClosesWithoutPanic(t *testing.T) {
+// TestPgReverseProxy_QuotedBatches_PreserveResults verifies monitoring cannot truncate valid multi-statement results
+func TestPgReverseProxy_QuotedBatches_PreserveResults(t *testing.T) {
 
 	// Prepare real PostgreSQL infrastructure with captured monitoring diagnostics
 	port, certificate := test_postgres(t)
@@ -135,18 +136,200 @@ func TestPgReverseProxy_UntrackedCompletion_ClosesWithoutPanic(t *testing.T) {
 	t.Cleanup(func() {
 		proxy.Stop()
 		logger.SetOutput(io.Discard)
-		if strings.Contains(logs.String(), "Panic:") || !strings.Contains(logs.String(), "Statement 1 does not exist in statement sequence.") {
-			t.Errorf("Monitoring log = '%s', want = 'missing statement without panic'", logs.String())
+		if strings.Contains(logs.String(), "Panic:") || strings.Contains(logs.String(), "does not exist in statement sequence") {
+			t.Errorf("Monitoring log = '%s', want = 'no panic or missing statement'", logs.String())
 		}
 	})
 
-	// Connect a client to exercise the real monitoring and response-forwarding path
+	// Connect a client and reproduce the preceding transaction command from the reported failure
 	conn := test_connect(t, proxy, certificate, "scram_user", true)
+	if _, errBegin := conn.Exec(t.Context(), "BEGIN READ ONLY", pgx.QueryExecModeSimpleProtocol); errBegin != nil {
+		t.Fatal(errBegin)
+	}
 
-	// An escaped quote makes the lightweight splitter track one query while PostgreSQL executes two
-	_, errQuery := conn.Exec(t.Context(), `SELECT E'\''; SELECT 2`, pgx.QueryExecModeSimpleProtocol)
-	if errQuery == nil {
-		t.Error("Exec() error = 'nil', want = 'connection closed for untracked completion'")
+	// Prepare unit test data for quoted content and comments inside real PostgreSQL batches
+	tests := []struct {
+		name  string
+		first string
+	}{
+		{
+			name:  "reported-cte-batch",
+			first: `WITH sample AS (SELECT E'comma, quote"\r\nsecond line\tend' AS text) SELECT text, 'https://example.com' AS url, 'Grüße 日本語 😀' AS unicode, array['a,b', E'c\nd'] AS items, '{"a":"b,c"}'::jsonb AS json FROM sample`,
+		},
+		{
+			name:  "escaped-quote",
+			first: `SELECT E'\''`,
+		},
+		{
+			name:  "quoted-comment-markers",
+			first: `SELECT 'a--b/*c' AS "https://example.com;"`,
+		},
+		{
+			name:  "dollar-quoted-string",
+			first: `SELECT $tag$a';--/*https://example.com$tag$`,
+		},
+		{
+			name:  "nested-comment",
+			first: `SELECT 1 /* outer /* inner */ ; ' */`,
+		},
+	}
+
+	// Prepare and run test cases on the same connection to detect leftover monitoring entries
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			// Verify a populated result, an empty result and a SHOW response all reach the client
+			query := test.first + "; SELECT 1 AS no_rows WHERE false; SHOW transaction_read_only; /* tail */"
+			results, errResults := conn.PgConn().Exec(t.Context(), query).ReadAll()
+			if errResults != nil || len(results) != 3 {
+				t.Fatalf("Exec() results = '%d', error = '%v', want = '3, nil'", len(results), errResults)
+			}
+			if len(results[0].Rows) != 1 || len(results[1].Rows) != 0 || len(results[2].Rows) != 1 || string(results[2].Rows[0][0]) != "on" {
+				t.Errorf("Exec() rows = '%v', want = 'one row, zero rows, read-only on'", results)
+			}
+		})
+	}
+
+	// Verify comment-only input and the next request leave the connection usable
+	if _, errComments := conn.Exec(t.Context(), "/* outer /* inner */ done */; -- end", pgx.QueryExecModeSimpleProtocol); errComments != nil {
+		t.Error(errComments)
+	}
+	var value int
+	if errValue := conn.QueryRow(t.Context(), "SELECT 42", pgx.QueryExecModeSimpleProtocol).Scan(&value); errValue != nil || value != 42 {
+		t.Errorf("QueryRow() value = '%d', error = '%v', want = '42, nil'", value, errValue)
+	}
+}
+
+// TestPgReverseProxy_SplitterCorpus_MatchesPostgres verifies split boundaries and values against a real server
+func TestPgReverseProxy_SplitterCorpus_MatchesPostgres(t *testing.T) {
+
+	// Prepare a real server and an independent direct connection as the result oracle
+	port, certificate := test_postgres(t)
+	proxy := test_proxy(t, port, "require", certificate, true)
+	conn := test_connect(t, proxy, certificate, "postgres", true)
+	direct, errDirect := pgx.Connect(t.Context(), fmt.Sprintf("host=127.0.0.1 port=%d user=postgres dbname=postgres sslmode=disable", port))
+	if errDirect != nil {
+		t.Fatal(errDirect)
+	}
+	defer func() { _ = direct.Close(context.Background()) }()
+
+	// Prepare operator and rule fixtures only in the disposable database
+	if _, errOperator := direct.Exec(t.Context(), "CREATE OPERATOR // (LEFTARG=int4, RIGHTARG=int4, FUNCTION=int4div)"); errOperator != nil {
+		t.Fatal(errOperator)
+	}
+	for _, connection := range []*pgx.Conn{direct, conn} {
+		if _, errTables := connection.Exec(t.Context(), "CREATE TEMP TABLE example_source(value int); CREATE TEMP TABLE example_sink(value int)", pgx.QueryExecModeSimpleProtocol); errTables != nil {
+			t.Fatal(errTables)
+		}
+	}
+
+	// Extend the shared lexical corpus with unquoted SQL routine bodies and parenthesized rule actions
+	queries := append(test_splitExpressions(),
+		`SELECT 8 // 2`,
+		`DO $$ BEGIN PERFORM 1; PERFORM 2; END $$`,
+		`CREATE OR REPLACE FUNCTION example() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; SELECT CASE WHEN true THEN 2 ELSE 3 END; END`,
+		`CREATE OR REPLACE PROCEDURE example_procedure() LANGUAGE SQL BEGIN ATOMIC SELECT (CASE WHEN true THEN 1 ELSE 2 END); SELECT 3; END`,
+		`CREATE OR REPLACE RULE example_rule AS ON INSERT TO example_source DO ALSO (INSERT INTO example_sink VALUES (1); INSERT INTO example_sink VALUES (2);)`,
+		`CREATE OR REPLACE FUNCTION example_begin() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1 AS begin; SELECT 3; END`,
+		`CREATE OR REPLACE FUNCTION example_end() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT CASE WHEN true THEN 1 ELSE 2 END AS end; SELECT 3; END`,
+	)
+
+	// Prepare and run test cases through both paths, including an empty middle result and trailing comments
+	for i, query := range queries {
+		t.Run(fmt.Sprintf("query-%02d", i), func(t *testing.T) {
+
+			// Verify the server accepts the fixture before using its result as an oracle
+			batch := query + "; SELECT 1 WHERE false; SELECT 42; /* tail */; -- tail"
+			want, errWant := direct.PgConn().Exec(t.Context(), batch).ReadAll()
+			if errWant != nil {
+				t.Fatalf("Direct Exec() error = '%v', want = 'nil for %q'", errWant, query)
+			}
+
+			// Verify splitting matches the actual statement count and proxying preserves every result
+			got, errGot := conn.PgConn().Exec(t.Context(), batch).ReadAll()
+			if errGot != nil || len(got) != len(want) || len(splitQueries(batch, true)) != len(want) {
+				t.Fatalf("Proxy Exec() results = '%d', error = '%v', want = '%d, nil'", len(got), errGot, len(want))
+			}
+			for n := range want {
+				if !reflect.DeepEqual(got[n].Rows, want[n].Rows) || got[n].CommandTag.String() != want[n].CommandTag.String() {
+					t.Errorf("Proxy Exec() result = '%v', want = '%v'", got[n], want[n])
+				}
+			}
+		})
+	}
+}
+
+// TestPgReverseProxy_StringModesAndErrors_PreserveConnection verifies startup and session changes and error recovery
+func TestPgReverseProxy_StringModesAndErrors_PreserveConnection(t *testing.T) {
+
+	// Prepare a real proxy with monitoring enabled and legacy string behavior requested at startup
+	port, certificate := test_postgres(t)
+	proxy := test_proxy(t, port, "require", certificate, true)
+	config := test_clientConfig(t, proxy, certificate, "scram_user", true)
+	config.RuntimeParams["standard_conforming_strings"] = "off"
+	conn, errConn := pgx.ConnectConfig(t.Context(), config)
+	if errConn != nil {
+		t.Fatal(errConn)
+	}
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	// Verify the initial server mode, subsequent toggles and transaction-local restoration
+	steps := []struct {
+		command string
+		query   string
+	}{
+		{
+			query: `SELECT '\''; SELECT 42`,
+		},
+		{
+			command: "SET standard_conforming_strings=on",
+			query:   `SELECT '\'; SELECT 42`,
+		},
+		{
+			command: "BEGIN; SET LOCAL standard_conforming_strings=off",
+			query:   `SELECT N'\''; SELECT 42`,
+		},
+		{
+			command: "ROLLBACK",
+			query:   `SELECT '\'; SELECT 42`,
+		},
+	}
+	for i, step := range steps {
+		t.Run(fmt.Sprintf("mode-step-%d", i), func(t *testing.T) {
+
+			// Apply each setting in a completed request, as advertised by ParameterStatus
+			if step.command != "" {
+				if _, errCommand := conn.Exec(t.Context(), step.command, pgx.QueryExecModeSimpleProtocol); errCommand != nil {
+					t.Fatal(errCommand)
+				}
+			}
+
+			// Verify both commands arrive even when their quotes have mode-dependent meanings
+			results, errResults := conn.PgConn().Exec(t.Context(), step.query).ReadAll()
+			if errResults != nil || len(results) != 2 {
+				t.Errorf("Exec() results = '%d', error = '%v', want = '2, nil'", len(results), errResults)
+			}
+		})
+	}
+
+	// Verify invalid SQL still yields the original database error and permits a subsequent valid request
+	queries := []string{`SELECT 'unfinished`, `SELECT "unfinished`, `SELECT $tag$unfinished`, `SELECT 1 /* unfinished`, `SELECT (1; SELECT 2`, `SELECT 1; SELECT 1/0; SELECT 3`}
+	for i, query := range queries {
+		t.Run(fmt.Sprintf("error-recovery-%d", i), func(t *testing.T) {
+
+			// Keep the server error observable rather than replacing it with a proxy disconnect
+			_, errQuery := conn.PgConn().Exec(t.Context(), query).ReadAll()
+			var errPg *pgconn.PgError
+			if !errors.As(errQuery, &errPg) {
+				t.Errorf("Exec() error = '%v', want = 'PostgreSQL error'", errQuery)
+			}
+
+			// Verify the bookkeeping is aligned after the failed batch
+			var value int
+			if errValue := conn.QueryRow(t.Context(), "SELECT 42", pgx.QueryExecModeSimpleProtocol).Scan(&value); errValue != nil || value != 42 {
+				t.Errorf("QueryRow() value = '%d', error = '%v', want = '42, nil'", value, errValue)
+			}
+		})
 	}
 }
 

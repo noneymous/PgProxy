@@ -7,6 +7,10 @@ Furthermore, each SNI can redirect the client to a different Postgres database.
 
 PgProxy can optionally log user queries and execution times. A custom function can be defined working, processing or storing that data.
 
+Query monitoring uses a lightweight statement-boundary scanner, not a full SQL parser. It assumes UTF-8 or a single-byte
+client encoding. When changing `standard_conforming_strings`, wait for the server response before sending queries that
+depend on the new setting, because monitoring follows the server's acknowledged value.
+
 PgProxy is especially handy, if you are using Amazon RDS in a way allowing clients/users to directly connect to the database.
 Amazon RDS deploys with an SSL certificate issued by Amazon, which cannot be verified by clients/users without further configuration, or which might confuse your users.
 There is no simple way to deploy your own SSL certificate on Amazon RDS.

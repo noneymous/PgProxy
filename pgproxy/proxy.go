@@ -998,6 +998,7 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 
 	// Prepare memory for key data from database
 	var keyData *pgproto3.BackendKeyData
+	var standardStrings = true
 
 	// Read messages from database and copy to client until connection is 'ReadyForQuery'
 	for {
@@ -1046,6 +1047,11 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			// Copy values of Receive() to key data for later usage
 			keyDataCopy := *data
 			keyData = &keyDataCopy
+
+		} else if parameter, isParameter := response.(*pgproto3.ParameterStatus); isParameter && parameter.Name == "standard_conforming_strings" {
+
+			// Match the server's initial string escaping rules when monitoring simple queries
+			standardStrings = parameter.Value == "on"
 
 		} else if _, isReady := response.(*pgproto3.ReadyForQuery); isReady {
 
@@ -1190,9 +1196,14 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 				switch q := msgFrontend.(type) {
 				case *pgproto3.Query: // Simple message flow, client asking to execute a query string, short version of Parse-Bind-Execute-Sync
 
+					// Snapshot the server's current string mode without holding the sequence lock while scanning
+					statementLock.Lock()
+					standardStringsCurrent := standardStrings
+					statementLock.Unlock()
+
 					// Split multi-query into single SQL statements.
 					// Single SQL statements are sanitized already.
-					queries := splitQueries(q.String)
+					queries := splitQueries(q.String, standardStringsCurrent)
 
 					// The database will execute the query sent by the user and drop intermittent empty queries.
 					// If there are no queries at all, the database will still process it as an empty query and
@@ -1575,6 +1586,13 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 					// (e.g. if notification of client after SET statement is intended)
 					logger.Debugf("Response Type '%T', backend set '%s' to '%s'.", resp, resp.Name, resp.Value)
 
+					// Apply acknowledged session changes before the response becomes visible to the client
+					if resp.Name == "standard_conforming_strings" {
+						statementLock.Lock()
+						standardStrings = resp.Value == "on"
+						statementLock.Unlock()
+					}
+
 					// Update application name in startup data and active connections
 					if resp.Name == "application_name" && resp.Value != "" {
 
@@ -1802,91 +1820,231 @@ func saslAuth(fe *pgproto3.Frontend, password string, serverAuthMechanisms []str
 
 // splitQueries checks whether a query consists out of multiple single queries, indicated by a semicolon,
 // to be executed by the database. Returns a slice of queries. Queries are sanitized by empty leading or trailing
-// symbols. Empty queries are removed. If there is no useful query content at all, an empty slice is returned
-func splitQueries(sql string) []string {
+// symbols. Empty and comment-only queries are removed. standardStrings matches the server's
+// standard_conforming_strings setting. If there is no useful query content, an empty slice is returned
+func splitQueries(sql string, standardStrings bool) []string {
 
 	// Cleanup empty characters from both ends
 	sql = trimEmptySyntax(sql)
 
-	// Define parse states
-	const ( // iota is reset to 0
-		CommentNone             = 0
-		CommentMaybe            = iota
-		CommentLine             = iota
-		CommentMultiline        = iota
-		CommentMultilineClosing = iota
-	)
+	// Track statement boundaries without changing the SQL forwarded to PostgreSQL
+	queries := make([]string, 0)
+	start := 0
+	hasContent := false
 
-	// Prepare memory for field func states
-	commentState := CommentNone
-	quotedSingle := false
-	quotedDouble := false
+	// Keep quoted text independent of comment parsing
+	quote := byte(0)
+	escapeString := false
+	dollarQuote := ""
 
-	// Split queries by semicolon if it does not occure within single quotes, double quotes or any kind of comment
-	queries := strings.FieldsFunc(sql, func(r rune) bool {
+	// PostgreSQL block comments may nest and line comments end at either newline character
+	commentDepth := 0
+	lineComment := false
 
-		// Manage opening/closing of line comment
-		if commentState == CommentNone {
-			if r == '/' || r == '-' {
-				commentState = CommentMaybe
-			}
-		} else if commentState == CommentMaybe {
-			if r == '/' || r == '-' {
-				commentState = CommentLine
-			} else if r == '*' {
-				commentState = CommentMultiline
-			} else if r != '/' {
-				commentState = CommentNone
-			}
-		} else if commentState == CommentLine {
-			if r == '\n' {
-				commentState = CommentNone
-			}
-		} else if commentState == CommentMultiline {
-			if r == '*' {
-				commentState = CommentMultilineClosing
-			}
-		} else if commentState == CommentMultilineClosing {
-			if r == '/' {
-				commentState = CommentNone
-			} else if r != '*' {
-				commentState = CommentMultiline // Fall back, multi line comment is not yet closing
-			}
+	// SQL routine bodies and rule action lists contain semicolons that do not end the outer statement
+	parenDepth := 0
+	routineDepth := 0
+	routine := false
+	words := make([]string, 0, 4)
+	routineBegin := false
+	statementStart := true
+
+	// Recognize identifier bytes so E prefixes and dollar quotes cannot start inside identifiers
+	identifierPart := func(value byte) bool {
+		return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+			value >= '0' && value <= '9' || value == '_' || value >= 128
+	}
+
+	// Consume each byte once, splitting only outside quoted text and comments
+	for i := 0; i < len(sql); i++ {
+
+		// Ignore all syntax inside a line comment
+		if lineComment {
+			lineComment = sql[i] != '\n' && sql[i] != '\r'
+			continue
 		}
 
-		// If not commented, check if quoted string starts
-		if commentState <= CommentMaybe {
-
-			// Manage opening/closing of double quote strings
-			if r == '"' && !quotedSingle {
-				quotedDouble = !quotedDouble
+		// Count nested block comments without interpreting their quotes or semicolons
+		if commentDepth > 0 {
+			if strings.HasPrefix(sql[i:], "/*") {
+				commentDepth++
+				i++
+			} else if strings.HasPrefix(sql[i:], "*/") {
+				commentDepth--
+				i++
 			}
-
-			// Manage opening/closing of single quote strings
-			if r == '\'' && !quotedDouble {
-				quotedSingle = !quotedSingle
-			}
+			continue
 		}
 
-		// Return true if character unquoted and uncommented semicolon
-		return r == ';' &&
-			!quotedSingle &&
-			!quotedDouble &&
-			commentState != CommentLine &&
-			commentState != CommentMultiline
-	})
+		// A dollar-quoted body ends only at its exact, case-sensitive delimiter
+		if dollarQuote != "" {
+			if strings.HasPrefix(sql[i:], dollarQuote) {
+				i += len(dollarQuote) - 1
+				dollarQuote = ""
+			}
+			continue
+		}
 
-	// Sanitize split queries and remove empty ones
-	queriesSanitized := make([]string, 0, len(queries))
-	for _, query := range queries {
-		query = trimEmptySyntax(query)
-		if len(query) > 0 {
-			queriesSanitized = append(queriesSanitized, query)
+		// Preserve doubled quotes and backslash escapes in E-prefixed string literals
+		if quote != 0 {
+			if escapeString && sql[i] == '\\' {
+				i++
+			} else if sql[i] == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+
+					// Continued E strings retain their escape rules across newlines and line comments
+					if escapeString {
+						end := i + 1
+						newline := false
+						for end < len(sql) {
+							if strings.ContainsRune(" \t\n\r\f\v", rune(sql[end])) {
+								newline = newline || sql[end] == '\n' || sql[end] == '\r'
+								end++
+							} else if strings.HasPrefix(sql[end:], "--") {
+								for end < len(sql) && sql[end] != '\n' && sql[end] != '\r' {
+									end++
+								}
+							} else {
+								break
+							}
+						}
+						if newline && end < len(sql) && sql[end] == '\'' {
+							quote = '\''
+							i = end
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// PostgreSQL recognizes -- and /* comments, while // can be an operator
+		switch {
+		case strings.HasPrefix(sql[i:], "--"):
+			lineComment = true
+			i++
+		case strings.HasPrefix(sql[i:], "/*"):
+			commentDepth = 1
+			i++
+		case sql[i] == '\'' || sql[i] == '"':
+
+			// Only character strings honor backslash escapes, bit and hex literals do not
+			quote = sql[i]
+			routineBegin = false
+			statementStart = false
+			prefix := byte(0)
+			if i > 0 && (i == 1 || !identifierPart(sql[i-2]) && sql[i-2] != '$') {
+				prefix = sql[i-1]
+			}
+			escapeString = quote == '\'' && (prefix == 'E' || prefix == 'e' ||
+				!standardStrings && prefix != 'B' && prefix != 'b' && prefix != 'X' && prefix != 'x')
+			hasContent = true
+
+		case sql[i] == '$' && (i == 0 || !identifierPart(sql[i-1]) && sql[i-1] != '$'):
+
+			// Accept empty tags or identifier-like tags, but not numbered parameters such as $1
+			end := i + 1
+			for end < len(sql) && identifierPart(sql[end]) && (end > i+1 || sql[end] < '0' || sql[end] > '9') {
+				end++
+			}
+			if end < len(sql) && sql[end] == '$' {
+				dollarQuote = sql[i : end+1]
+				i = end
+			}
+			hasContent = true
+			routineBegin = false
+			statementStart = false
+
+		case identifierPart(sql[i]) && (sql[i] < '0' || sql[i] > '9'):
+
+			// Consume complete identifiers so embedded dollar signs and E letters cannot open literals
+			end := i + 1
+			for end < len(sql) && (identifierPart(sql[end]) || sql[end] == '$') {
+				end++
+			}
+			word := sql[i:end]
+
+			// Recognize CREATE [OR REPLACE] FUNCTION or PROCEDURE without interpreting names or argument lists
+			if parenDepth == 0 {
+				if len(words) < 4 {
+					words = append(words, strings.ToUpper(word))
+				}
+				routine = len(words) >= 2 && words[0] == "CREATE" && (words[1] == "FUNCTION" || words[1] == "PROCEDURE") ||
+					len(words) == 4 && words[0] == "CREATE" && words[1] == "OR" && words[2] == "REPLACE" && (words[3] == "FUNCTION" || words[3] == "PROCEDURE")
+
+				// Only BEGIN ATOMIC opens a body, and only a statement-leading END closes it
+				if routine && routineBegin && strings.EqualFold(word, "ATOMIC") {
+					routineDepth++
+					routineBegin = false
+					statementStart = true
+				} else {
+					if routineDepth > 0 && statementStart && strings.EqualFold(word, "END") {
+						routineDepth--
+					}
+					routineBegin = routine && strings.EqualFold(word, "BEGIN") && (routineDepth == 0 || statementStart)
+					statementStart = false
+				}
+			}
+			i = end - 1
+			hasContent = true
+
+		case sql[i] == '(':
+			parenDepth++
+			hasContent = true
+			routineBegin = false
+			statementStart = false
+		case sql[i] == ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+			hasContent = true
+			routineBegin = false
+			statementStart = false
+
+		case sql[i] == ';':
+
+			// Leave routine and parenthesized action separators inside their containing statement
+			if parenDepth > 0 {
+				continue
+			}
+			if routineDepth > 0 {
+				statementStart = true
+				routineBegin = false
+				continue
+			}
+
+			// PostgreSQL sends no completion for an empty or comment-only statement between separators
+			if hasContent {
+				queries = append(queries, trimEmptySyntax(sql[start:i]))
+			}
+			start = i + 1
+			hasContent = false
+			words = words[:0]
+			routine = false
+			routineBegin = false
+			statementStart = true
+
+		default:
+
+			// Whitespace and comments alone do not consume a statement response
+			if !strings.ContainsRune(" \t\n\r\f\v", rune(sql[i])) {
+				hasContent = true
+				routineBegin = false
+				statementStart = false
+			}
 		}
 	}
 
+	// Keep the final statement, including malformed input for PostgreSQL's own error handling
+	if hasContent || commentDepth > 0 {
+		queries = append(queries, trimEmptySyntax(sql[start:]))
+	}
+
 	// Return split queries
-	return queriesSanitized
+	return queries
 }
 
 // prettify returns a formatted SQL query string and a list of database tables it is targeting. An SQL query
