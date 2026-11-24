@@ -6,7 +6,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lithammer/shortuuid/v4 v4.2.0
-	github.com/noneymous/go-sqlfmt v1.4.3
+	github.com/noneymous/go-sqlfmt v1.4.4
 	github.com/orcaman/concurrent-map/v2 v2.0.1
 	github.com/siemens/GoScans v1.2.0
 	golang.org/x/crypto v0.56.0

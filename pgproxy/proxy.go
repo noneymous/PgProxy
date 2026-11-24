@@ -1314,6 +1314,12 @@ func (p *PgReverseProxy) handleClient(client net.Conn) {
 			errSend := databaseFrontend.Flush()
 			if errSend != nil {
 
+				// The other receiver or shutdown may close the database connection during forwarding
+				if errors.Is(errSend, net.ErrClosed) {
+					logger.Debugf("Could not send to database, connection already closed.")
+					return
+				}
+
 				// Log error
 				logger.Errorf("Proxying data to database failed: %s.", errSend)
 
@@ -2130,8 +2136,8 @@ func prettify(logger scanUtils.Logger, query string) (tables []string, sql strin
 		// Format parsed tokens into buffer
 		var sqlBuf bytes.Buffer
 		var errFormat error
-		for _, tokenParsed := range tokensParsed {
-			errFormat = tokenParsed.Format(&sqlBuf, nil, 0)
+		for i, tokenParsed := range tokensParsed {
+			errFormat = tokenParsed.Format(&sqlBuf, tokensParsed, i)
 			if errFormat != nil {
 				break
 			}

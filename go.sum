@@ -15,8 +15,8 @@ github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo
 github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
 github.com/lithammer/shortuuid/v4 v4.2.0 h1:LMFOzVB3996a7b8aBuEXxqOBflbfPQAiVzkIcHO0h8c=
 github.com/lithammer/shortuuid/v4 v4.2.0/go.mod h1:D5noHZ2oFw/YaKCfGy0YxyE7M0wMbezmMjPdhyEFe6Y=
-github.com/noneymous/go-sqlfmt v1.4.3 h1:piATorK4oTDv60U08X1qU+1zD9eXsiJ26ENW5e2qIxk=
-github.com/noneymous/go-sqlfmt v1.4.3/go.mod h1:g5RJjoEqFmAOSXuEu5u3qAjFYVUL38dwc0QAwmFz0LE=
+github.com/noneymous/go-sqlfmt v1.4.4 h1:CVPBnA9i9DzFtWUrb9GcBmClFZP0wn4K4EStJa79BAA=
+github.com/noneymous/go-sqlfmt v1.4.4/go.mod h1:g5RJjoEqFmAOSXuEu5u3qAjFYVUL38dwc0QAwmFz0LE=
 github.com/orcaman/concurrent-map/v2 v2.0.1 h1:jOJ5Pg2w1oeB6PeDurIYf6k9PQ+aTITr/6lP/L/zp6c=
 github.com/orcaman/concurrent-map/v2 v2.0.1/go.mod h1:9Eq3TG2oBe5FirmYWQfYO5iH1q0Jv47PLaNK++uCdOM=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

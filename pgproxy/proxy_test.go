@@ -597,6 +597,11 @@ func TestPrettify_FallbackCleanup_PreservesFormatting(t *testing.T) {
 			wantTables: []string{"example_table"},
 		},
 		{
+			name:    "explain-update-segment-context",
+			query:   `EXPLAIN UPDATE example_table SET id = 1`,
+			wantSql: "EXPLAIN\nUPDATE example_table\nSET id = 1",
+		},
+		{
 			name:        "tokenizer-error-empty-lines",
 			query:       "\n\tSELECT\n\n'unterminated\n",
 			wantSql:     "SELECT\n'unterminated",

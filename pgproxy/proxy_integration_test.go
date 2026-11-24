@@ -1,6 +1,7 @@
 package pgproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/noneymous/PgProxy/_test"
 	scanUtils "github.com/siemens/GoScans/utils"
 )
@@ -508,6 +510,125 @@ func TestPgReverseProxy_Shutdown_UnblocksActiveAndIdleClients(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Exec() state = 'blocked', want = 'connection closed'")
+	}
+}
+
+// TestPgReverseProxy_Shutdown_ClosedDatabaseDoesNotReportFailure verifies interrupted writes remain cleanup diagnostics
+func TestPgReverseProxy_Shutdown_ClosedDatabaseDoesNotReportFailure(t *testing.T) {
+
+	// Prepare unit test data
+	port, certificate := test_postgres(t)
+	admin, errAdmin := pgx.Connect(t.Context(), fmt.Sprintf("host=127.0.0.1 port=%d user=postgres dbname=postgres sslmode=disable", port))
+	if errAdmin != nil {
+		t.Fatal(errAdmin)
+	}
+	defer func() { _ = admin.Close(context.Background()) }()
+
+	// Prepare and run test cases
+	for _, sslMode := range []string{"disable", "require"} {
+		t.Run(sslMode, func(t *testing.T) {
+
+			// Capture real proxy logs and observe when the second request reaches database forwarding
+			proxy := test_proxy(t, port, sslMode, certificate, false)
+			reader, writer := io.Pipe()
+			proxy.logger.(*scanUtils.TestLogger).SetOutput(writer)
+
+			// Keep log collection in one goroutine and signal forwarding without timing assumptions
+			var output bytes.Buffer
+			var forwarding = make(chan struct{})
+			var logged = make(chan struct{})
+			go func() {
+
+				// Collect every line before signaling that collection has finished
+				defer close(logged)
+				scanner := bufio.NewScanner(reader)
+				requests := 0
+				for scanner.Scan() {
+
+					// Observe the second request immediately before its database write
+					line := scanner.Text()
+					_, _ = fmt.Fprintln(&output, line)
+					if strings.Contains(line, "Forwarding frontend message.") {
+						requests++
+						if requests == 2 {
+							close(forwarding)
+						}
+					}
+				}
+			}()
+
+			// Prepare cleanup
+			t.Cleanup(func() {
+				_ = writer.Close()
+				_ = reader.Close()
+				<-logged
+			})
+
+			// Open a real protocol connection without a concurrent pgx query reader
+			conn := test_connect(t, proxy, certificate, "scram_user", sslMode == "require")
+			frontend := pgproto3.NewFrontend(conn.PgConn().Conn(), conn.PgConn().Conn())
+
+			// Keep PostgreSQL busy so the large second request cannot finish writing before shutdown
+			frontend.Send(&pgproto3.Query{String: "SELECT pg_sleep(30)"})
+			if errSend := frontend.Flush(); errSend != nil {
+				t.Fatal(errSend)
+			}
+
+			// Wait until the backend is sleeping so it cannot read ahead into the second request
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				var sleeping bool
+				if errSleeping := admin.QueryRow(t.Context(), "SELECT coalesce(wait_event = 'PgSleep', false) FROM pg_stat_activity WHERE pid = $1", conn.PgConn().PID()).Scan(&sleeping); errSleeping != nil {
+					t.Fatal(errSleeping)
+				}
+				if sleeping {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("pg_stat_activity() state = 'not sleeping', want = 'PgSleep'")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// Send enough data to exceed socket buffers while PostgreSQL is sleeping
+			frontend.Send(&pgproto3.Query{String: "SELECT 1 /*" + strings.Repeat("x", 32<<20) + "*/"})
+			sent := make(chan struct{})
+			go func() {
+
+				// Allow shutdown to interrupt either side of the large request
+				defer close(sent)
+				_ = frontend.Flush() // Shutdown may interrupt the client write too
+			}()
+
+			// Verify the request reached forwarding before closing the database socket underneath it
+			select {
+			case <-forwarding:
+			case <-time.After(10 * time.Second):
+				t.Fatal("handleClient() state = 'waiting', want = 'forwarding second request'")
+			}
+
+			// Verify shutdown releases both proxy receivers and the client writer
+			stopped := make(chan struct{})
+			go func() { proxy.Stop(); close(stopped) }()
+			select {
+			case <-stopped:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Stop() state = 'blocked', want = 'stopped'")
+			}
+			select {
+			case <-sent:
+			case <-time.After(time.Second):
+				t.Fatal("Flush() state = 'blocked', want = 'released after shutdown'")
+			}
+
+			// Verify the closed socket is recognized without reporting a database forwarding failure
+			_ = writer.Close()
+			<-logged
+			if strings.Contains(output.String(), "Proxying data to database failed:") ||
+				strings.Contains(output.String(), "Forwarding error response to client.") {
+				t.Errorf("handleClient() log = '%s', want = 'no database failure during shutdown'", output.String())
+			}
+		})
 	}
 }
 
